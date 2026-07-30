@@ -1,0 +1,348 @@
+/**
+ * The degradation suite. This is the exit criterion, not a nicety.
+ *
+ * Seven tests, one per upstream, each killing exactly one peer and asserting three things:
+ *
+ *   1. the response is **200**, never a 500 and never a 503;
+ *   2. every tile fed by the dead peer says so, with a reason;
+ *   3. **every other tile is still `ok`** — which is the half that catches regressions, because
+ *      it fails the moment somebody adds a convenient extra upstream call inside a loader.
+ *
+ * The upstreams are real HTTP listeners that get closed, so what is being exercised is a refused
+ * connection through the real `HttpClient`, not a stubbed rejection. Nothing here needs a service
+ * running or a database.
+ */
+
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { TILE_SOURCES } from './dashboard.ts'
+import { UPSTREAM_NAMES, get, withHub, type UpstreamName } from './testsupport.ts'
+
+interface WireTile {
+  readonly status: 'ok' | 'degraded' | 'unavailable'
+  readonly upstream: string
+  readonly reason: string | null
+  readonly cached: boolean
+  readonly ageMs: number | null
+  readonly data: unknown
+}
+
+interface WireDashboard {
+  readonly userId: string
+  readonly generatedAt: string
+  readonly elapsedMs: number
+  readonly tiles: Record<string, WireTile>
+  readonly nextActions: {
+    readonly actions: readonly { readonly kind: string; readonly verb: string; readonly href: string }[]
+    readonly missing: readonly { readonly source: string; readonly reason: string }[]
+  }
+  readonly degraded: readonly string[]
+}
+
+const tilesFedBy = (upstream: UpstreamName): string[] =>
+  Object.entries(TILE_SOURCES)
+    .filter(([, sources]) => (sources as readonly string[]).includes(upstream))
+    .map(([tile]) => tile)
+
+/**
+ * `notifications` is excluded from the "everything else is ok" assertion because it is
+ * structurally unavailable: `notify` is not one of this service's upstreams. It is asserted
+ * explicitly in its own test, so the hole stays visible rather than becoming background noise.
+ */
+const ALWAYS_UNAVAILABLE = new Set(['notifications'])
+
+test('with every upstream healthy the dashboard is complete', async () => {
+  await withHub({}, async (h) => {
+    const res = await get(h, '/v1/dashboard')
+    assert.equal(res.status, 200)
+    const body = (await res.json()) as WireDashboard
+
+    for (const [name, tile] of Object.entries(body.tiles)) {
+      if (ALWAYS_UNAVAILABLE.has(name)) continue
+      assert.equal(tile.status, 'ok', `${name} should be ok but was ${tile.status}: ${tile.reason}`)
+      assert.equal(tile.reason, null, `${name} carried a reason while ok`)
+    }
+    assert.deepEqual(body.degraded, ['notifications'])
+  })
+})
+
+test('the portfolio carries its pricing timestamp, and it is the oldest observation', async () => {
+  await withHub({}, async (h) => {
+    const res = await get(h, '/v1/dashboard')
+    const body = (await res.json()) as WireDashboard
+    const portfolio = body.tiles['portfolio']?.data as {
+      pricedAt: string
+      totalUsd: string
+      pricingComplete: boolean
+      holdings: { assetCode: string; usd: string | null; allocationBps: number | null }[]
+      allocation: { label: string }[]
+    }
+
+    // BTC was quoted at 14:20 and EMBER at 14:22. The total is as old as its oldest input, and
+    // reporting 14:22 would overstate the confidence of the one number a user actually reads.
+    assert.equal(portfolio.pricedAt, '2026-07-30T14:20:00.000Z')
+    assert.equal(portfolio.pricingComplete, true)
+
+    // 0.5 BTC at 60,000 + 4 EMBER at 2 + 124,800 Shards at 100 per USD = 30,000 + 8 + 1,248.
+    assert.equal(portfolio.totalUsd, '31256')
+    assert.equal(portfolio.holdings[0]?.assetCode, 'BTC', 'holdings must be sorted by value')
+    assert.equal(portfolio.holdings.at(-1)?.assetCode, 'EMBER')
+  })
+})
+
+test('wallet lifecycle state reaches the client', async () => {
+  // §6 rule 3: `exported` and `external·verified` are facts a user must see at a glance, so they
+  // must survive the composition rather than being flattened to "active".
+  await withHub({}, async (h) => {
+    const body = (await (await get(h, '/v1/dashboard')).json()) as WireDashboard
+    const wallets = body.tiles['wallets']?.data as { id: string; status: string; origin: string }[]
+    assert.equal(wallets.find((w) => w.id === 'w3')?.status, 'exported')
+    assert.equal(wallets.find((w) => w.id === 'w2')?.origin, 'external')
+  })
+})
+
+test('needs-you cards carry a verb and a deep link, one per source', async () => {
+  await withHub({}, async (h) => {
+    const body = (await (await get(h, '/v1/dashboard')).json()) as WireDashboard
+    const kinds = body.nextActions.actions.map((a) => a.kind)
+
+    assert.ok(kinds.includes('deposit_confirming'), 'a deposit at 41 confirmations must raise a card')
+    assert.ok(kinds.includes('mfa_disabled'), 'no active factor must raise the 2FA card')
+    assert.ok(kinds.includes('account_frozen'), 'an uncleared freeze must raise a card')
+    assert.ok(kinds.includes('subscription_past_due'), 'a past-due subscription must raise a card')
+    assert.ok(kinds.includes('withdrawal_stuck'), 'a stuck withdrawal must raise a card')
+
+    for (const action of body.nextActions.actions) {
+      assert.ok(action.verb.length > 0, `${action.kind} has no verb`)
+      assert.ok(action.href.startsWith('/'), `${action.kind} has no deep link`)
+    }
+    // Critical first, so the frozen account and the stuck withdrawal lead.
+    assert.equal(body.nextActions.missing.length, 0)
+  })
+})
+
+test('a confirming deposit carries its progress against the contract depth', async () => {
+  await withHub({}, async (h) => {
+    const body = (await (await get(h, '/v1/dashboard')).json()) as WireDashboard
+    const card = body.nextActions.actions.find((a) => a.kind === 'deposit_confirming') as unknown as {
+      detail: string
+      progress: { done: number; total: number; etaMinutes: number }
+    }
+    // 60 comes from `contracts-chain`, which is the same constant wallet, indexer and settlement
+    // credit against. Re-deriving it here would be this service inventing a fact.
+    assert.equal(card.detail, '41/60 confirmations')
+    assert.equal(card.progress.total, 60)
+    assert.equal(card.progress.done, 41)
+  })
+})
+
+test('notifications report themselves unavailable rather than being synthesised', async () => {
+  await withHub({}, async (h) => {
+    const body = (await (await get(h, '/v1/dashboard')).json()) as WireDashboard
+    const tile = body.tiles['notifications']
+    assert.equal(tile?.status, 'unavailable')
+    assert.match(tile?.reason ?? '', /notify is not a configured upstream/)
+  })
+})
+
+/* ------------------------------------------------------- the seven degradation tests */
+
+for (const dead of UPSTREAM_NAMES) {
+  test(`${dead} down costs its own tiles and nothing else`, async () => {
+    await withHub({}, async (h) => {
+      await h.estate.services[dead].kill()
+
+      const res = await get(h, '/v1/dashboard')
+      assert.equal(res.status, 200, `a dead ${dead} must not fail the page`)
+      const body = (await res.json()) as WireDashboard
+
+      const affected = tilesFedBy(dead)
+      assert.ok(affected.length > 0, `${dead} feeds no tile — the source map is wrong`)
+
+      let sawUnavailable = false
+      for (const [name, tile] of Object.entries(body.tiles)) {
+        if (ALWAYS_UNAVAILABLE.has(name)) continue
+        if (affected.includes(name)) {
+          assert.notEqual(tile.status, 'ok', `${name} is fed by ${dead} and cannot be ok`)
+          assert.ok(tile.reason, `${name} degraded without saying why`)
+          if (tile.status === 'unavailable') sawUnavailable = true
+        } else {
+          assert.equal(
+            tile.status,
+            'ok',
+            `${name} is not fed by ${dead} but was ${tile.status}: ${tile.reason}`,
+          )
+        }
+      }
+      assert.ok(sawUnavailable, `nothing was marked unavailable when ${dead} was down`)
+
+      // The tile that is still ok must still have its data, not merely its status.
+      const activityOk = !affected.includes('activity')
+      if (activityOk) {
+        assert.ok(
+          (body.tiles['activity']?.data as unknown[]).length > 0,
+          'a surviving tile must still be populated',
+        )
+      }
+    })
+  })
+}
+
+test('a dead source removes its cards and records why, without breaking the rest', async () => {
+  // §6 rule 2: "a card that cannot load is absent, not broken".
+  await withHub({}, async (h) => {
+    await h.estate.services.policy.kill()
+    const body = (await (await get(h, '/v1/dashboard')).json()) as WireDashboard
+
+    const kinds = body.nextActions.actions.map((a) => a.kind)
+    assert.ok(!kinds.includes('account_frozen'), 'the freeze card must be absent, not broken')
+    assert.ok(kinds.includes('mfa_disabled'), 'cards from live sources must survive')
+    assert.deepEqual(
+      body.nextActions.missing.map((m) => m.source),
+      ['policy'],
+    )
+  })
+})
+
+/* ------------------------------------------------------- deadlines */
+
+test('a slow upstream costs its tile, not the dashboard budget', async () => {
+  await withHub({ env: { dashboardDeadlineMs: 600, upstreamDeadlineMs: 250 } }, async (h) => {
+    // Far beyond any budget. The tile must give up; the page must not wait for it.
+    h.estate.services.activity.latencyMs = 4_000
+
+    const startedAt = Date.now()
+    const res = await get(h, '/v1/dashboard')
+    const elapsed = Date.now() - startedAt
+
+    assert.equal(res.status, 200)
+    assert.ok(elapsed < 2_000, `the dashboard took ${elapsed}ms against a 600ms budget`)
+    const body = (await res.json()) as WireDashboard
+    assert.equal(body.tiles['activity']?.status, 'unavailable')
+    assert.equal(body.tiles['wallets']?.status, 'ok', 'a slow peer must not cost a fast one')
+    assert.equal(body.tiles['portfolio']?.status, 'ok')
+  })
+})
+
+test('the page deadline is a backstop when an upstream outlives its own', async () => {
+  // The ordering below is refused by `loadEnv` on purpose, and is constructed here to isolate the
+  // page-level guard: with the per-request deadline set beyond the page budget, the only thing
+  // that can end the request is the dashboard-wide race.
+  await withHub({ env: { dashboardDeadlineMs: 300, upstreamDeadlineMs: 10_000 } }, async (h) => {
+    h.estate.services.billing.latencyMs = 5_000
+
+    const startedAt = Date.now()
+    const res = await get(h, '/v1/dashboard')
+    const elapsed = Date.now() - startedAt
+
+    assert.equal(res.status, 200)
+    assert.ok(elapsed < 2_000, `the page waited ${elapsed}ms for a peer that ignored its deadline`)
+    const tile = (await res.json() as WireDashboard).tiles['entitlements']
+    assert.equal(tile?.status, 'unavailable')
+    assert.match(tile?.reason ?? '', /dashboard deadline expired/)
+  })
+})
+
+/* ------------------------------------------------------- the circuit breaker */
+
+test('the breaker opens after repeated failures and the tile says so rather than retrying', async () => {
+  await withHub({ env: { circuitThreshold: 2, circuitResetMs: 60_000 } }, async (h) => {
+    // 503 rather than a closed socket: a struggling peer is the case the breaker exists for, and a
+    // 5xx is the fault class that must trip it while a 404 must not.
+    h.estate.services.pricing.failWith = 503
+
+    const first = (await (await get(h, '/v1/dashboard')).json()) as WireDashboard
+    assert.equal(first.tiles['prices']?.status, 'unavailable')
+    assert.equal(h.upstreams.circuitStates()['pricing'], 'open', 'two 5xx must open the breaker')
+
+    const callsBefore = h.estate.services.pricing.calls
+    const second = (await (await get(h, '/v1/dashboard')).json()) as WireDashboard
+
+    assert.equal(
+      h.estate.services.pricing.calls,
+      callsBefore,
+      'an open breaker must stop calling the peer entirely',
+    )
+    assert.match(second.tiles['prices']?.reason ?? '', /circuit is open/)
+    // And the rest of the page is untouched, which is the whole point of a per-upstream breaker.
+    assert.equal(second.tiles['wallets']?.status, 'ok')
+    assert.equal(second.tiles['activity']?.status, 'ok')
+  })
+})
+
+/* ------------------------------------------------------- caching */
+
+test('a tile served from a fresh cache says it was cached, and makes no call', async () => {
+  await withHub({}, async (h) => {
+    await get(h, '/v1/dashboard')
+    const callsAfterFirst = h.estate.services.wallet.calls
+    assert.ok(callsAfterFirst > 0)
+
+    const body = (await (await get(h, '/v1/dashboard')).json()) as WireDashboard
+    const tile = body.tiles['wallets']
+
+    assert.equal(tile?.status, 'ok', 'a fresh cache hit is still ok')
+    assert.equal(tile?.cached, true, 'a served-from-cache tile must say so')
+    assert.ok((tile?.ageMs ?? -1) >= 0, 'a cached tile must carry its age')
+    assert.equal(h.estate.services.wallet.calls, callsAfterFirst, 'a cache hit must make no call')
+  })
+})
+
+test('a stale cache served through an outage is degraded, never ok', async () => {
+  // The rule this encodes: a cache that hides an outage is worse than no cache.
+  let clock = 1_700_000_000_000
+  await withHub({ now: () => clock }, async (h) => {
+    await get(h, '/v1/dashboard')
+
+    // Past the wallet registry's 60s TTL, inside its 15-minute stale window.
+    clock += 70_000
+    await h.estate.services.wallet.kill()
+
+    const body = (await (await get(h, '/v1/dashboard')).json()) as WireDashboard
+    const tile = body.tiles['wallets']
+
+    assert.equal(tile?.status, 'degraded', 'stale data must never be presented as current')
+    assert.equal(tile?.cached, true)
+    assert.equal(tile?.ageMs, 70_000)
+    assert.match(tile?.reason ?? '', /showing a cached value/)
+    assert.ok((tile?.data as unknown[]).length > 0, 'the stale value is still served')
+  })
+})
+
+test('past the stale window the tile becomes a hole rather than an old number', async () => {
+  let clock = 1_700_000_000_000
+  await withHub({ now: () => clock }, async (h) => {
+    await get(h, '/v1/dashboard')
+
+    // Sixteen minutes: beyond the wallet registry's stale window entirely.
+    clock += 16 * 60_000
+    await h.estate.services.wallet.kill()
+
+    const body = (await (await get(h, '/v1/dashboard')).json()) as WireDashboard
+    assert.equal(body.tiles['wallets']?.status, 'unavailable')
+    assert.deepEqual(body.tiles['wallets']?.data, [])
+  })
+})
+
+/* ------------------------------------------------------- metrics */
+
+test('every tile outcome is counted, by tile and status', async () => {
+  await withHub({}, async (h) => {
+    await h.estate.services.billing.kill()
+    await get(h, '/v1/dashboard')
+
+    const rendered = h.metrics.render()
+    assert.match(rendered, /hub_tile_status_total\{tile="entitlements",status="unavailable"\} 1/)
+    assert.match(rendered, /hub_tile_status_total\{tile="wallets",status="ok"\} 1/)
+    assert.match(rendered, /hub_upstream_ms/)
+    assert.match(rendered, /hub_dashboard_ms/)
+  })
+})
+
+test('cache hits are counted per upstream', async () => {
+  await withHub({}, async (h) => {
+    await get(h, '/v1/dashboard')
+    await get(h, '/v1/dashboard')
+    assert.match(h.metrics.render(), /hub_cache_hits_total\{upstream="wallet"\}/)
+  })
+})

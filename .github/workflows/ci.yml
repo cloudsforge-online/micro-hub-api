@@ -1,0 +1,174 @@
+# Continuous integration.
+#
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# THIS FILE IS TEMPORARY. Once `cloudsforge/.github` exists (AD-03), everything below is deleted
+# and replaced by a call to the shared reusable workflow, referenced by path:
+#
+#   jobs:
+#     ci:
+#       uses: cloudsforge/.github/.github/workflows/service-ci.yml@v1
+#       with:
+#         service: hub-api
+#       secrets: inherit
+#
+# The measured target in docs/ecosystem/03 §5 is **zero repositories with a bespoke CI file**, so
+# treat every line here as a liability with a deletion date rather than as something to extend.
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # No `services:` block. This service has no database, and its tests boot seven fake upstreams
+    # on ephemeral ports rather than requiring a peer to be running — which is what makes the
+    # degradation suite runnable at all: it needs to *kill* upstreams.
+    steps:
+      # Temporary: the three checkouts and the sibling layout exist only because the runtime and
+      # contracts packages are unpublished. On publish this collapses to one checkout with no
+      # `path:`.
+      - uses: actions/checkout@v4
+        with:
+          path: hub-api
+      - uses: actions/checkout@v4
+        with:
+          repository: cloudsforge/micro-runtime
+          path: runtime
+      - uses: actions/checkout@v4
+        with:
+          repository: cloudsforge/micro-contracts
+          path: contracts
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: hub-api/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: hub-api
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        working-directory: hub-api
+        run: pnpm typecheck
+
+      - name: Test
+        working-directory: hub-api
+        run: pnpm test
+
+  # The estate-wide rules from docs/ecosystem/03 §2, as checks rather than as review discipline.
+  rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 'Rule 1 — this service owns no database, and may not acquire one'
+        # Stricter than the template's version of this rule, and deliberately: the template allows
+        # its own connection string, and this service allows none at all. A BFF with a table is a
+        # BFF holding a stale copy of somebody else's truth.
+        run: |
+          if grep -rnE '[A-Z_]*DATABASE_URL' src/ --include='*.ts'; then
+            echo '::error::hub-api owns no state; a connection string must not appear in src/'
+            exit 1
+          fi
+          if grep -rnE '(postgres|postgresql)://' src/ --include='*.ts'; then
+            echo '::error::a connection string appears in src/'
+            exit 1
+          fi
+
+      - name: 'Rule 4 — livez, readyz and metrics exist'
+        run: |
+          for endpoint in /livez /readyz /metrics; do
+            grep -q "path: '$endpoint'" src/server.ts \
+              || { echo "::error::$endpoint is not served"; exit 1; }
+          done
+
+      - name: 'Rule 8 — every background timer is a leased job'
+        run: |
+          if grep -rnE '\bset(Interval|Timeout)\(' src/ --include='*.ts'; then
+            echo '::error::a timer was found; background work is a leased job (@cloudsforge/jobs)'
+            exit 1
+          fi
+
+      - name: 'Every upstream is reached with its own credential'
+        # AD-05: the BFF holds a scoped credential per upstream. One shared token would make a
+        # compromise of the estate's highest-fan-out surface a compromise of all seven peers.
+        run: |
+          for name in LEDGER WALLET BILLING ACTIVITY PRICING POLICY; do
+            grep -q "HUB_${name}_TOKEN" src/env.ts \
+              || { echo "::error::HUB_${name}_TOKEN is not declared"; exit 1; }
+          done
+          if grep -qE "HUB_SERVICE_TOKEN|HUB_UPSTREAM_TOKEN\b" src/env.ts; then
+            echo '::error::a single shared upstream credential was introduced'
+            exit 1
+          fi
+
+      - name: 'Every dashboard tile carries a status'
+        # The exit criterion of Phase 6, as a check. A tile added without an entry in TILE_SOURCES
+        # is a tile the degradation suite cannot reason about.
+        run: |
+          grep -q "export const TILE_SOURCES" src/dashboard.ts \
+            || { echo '::error::TILE_SOURCES is gone; the degradation suite has nothing to assert against'; exit 1; }
+          grep -q "hub_tile_status_total" src/server.ts \
+            || { echo '::error::the tile status metric is not registered'; exit 1; }
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      # Temporary, and for the same reason as above.
+      - uses: actions/checkout@v4
+        with:
+          path: hub-api
+      - uses: actions/checkout@v4
+        with:
+          repository: cloudsforge/micro-runtime
+          path: runtime
+      - uses: actions/checkout@v4
+        with:
+          repository: cloudsforge/micro-contracts
+          path: contracts
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: hub-api
+          # Temporary: drops out with the link: dependencies.
+          build-contexts: |
+            runtimepkgs=runtime
+            contractspkgs=contracts
+          push: false
+          load: true
+          tags: hub-api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 'The image must not run as root'
+        run: |
+          user=$(docker image inspect hub-api:${{ github.sha }} --format '{{.Config.User}}')
+          [ "$user" = "node" ] || { echo "::error::image runs as '${user:-root}'"; exit 1; }
+
+      - name: 'The image must not carry a secret'
+        run: |
+          if docker image inspect hub-api:${{ github.sha }} --format '{{json .Config.Env}}' \
+             | grep -iE 'secret|token|password|key'; then
+            echo '::error::a secret-shaped value is baked into the image environment'
+            exit 1
+          fi
