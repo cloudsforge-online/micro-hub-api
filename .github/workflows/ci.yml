@@ -1,21 +1,25 @@
-# Continuous integration.
-#
-# ────────────────────────────────────────────────────────────────────────────────────────────────
-# THIS FILE IS TEMPORARY. Once `cloudsforge/.github` exists (AD-03), everything below is deleted
-# and replaced by a call to the shared reusable workflow, referenced by path:
-#
-#   jobs:
-#     ci:
-#       uses: cloudsforge/.github/.github/workflows/service-ci.yml@v1
-#       with:
-#         service: hub-api
-#       secrets: inherit
-#
-# The measured target in docs/ecosystem/03 §5 is **zero repositories with a bespoke CI file**, so
-# treat every line here as a liability with a deletion date rather than as something to extend.
-# ────────────────────────────────────────────────────────────────────────────────────────────────
-
 name: CI
+
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# The estate-wide half of this file is a CALL, not a copy. The 188 lines it replaces said so
+# themselves: "THIS FILE IS TEMPORARY … deleted and replaced by a call to the shared reusable
+# workflow". That workflow exists, so this is that deletion.
+#
+# WHAT THE COPY COST WHILE IT SURVIVED. service-ci.yml runs a step no bespoke file had: it derives
+# every scope this service's route gates demand and fails if one is absent from the registry in
+# @cloudsforge/contracts-auth. identity refuses to mint a token naming an unknown scope, so an
+# unregistered scope is a service-to-service surface no identity-issued token can ever reach, and
+# no suite notices because each mints its own principals. This repository currently derives ZERO
+# demanded scopes — it is a BFF that authenticates the END USER and holds a separate credential per
+# upstream, so it gates on no service scope of its own. That zero is now a CHECKED zero rather than
+# an unexamined one: the first route gate added here without a registered scope fails the build.
+#
+# `postgres: false`, and it is the point of this service rather than an economy. A BFF with a table
+# is a BFF holding a stale copy of somebody else's truth; the `controls` job below asserts that no
+# connection string can appear in src/ at all, which is stricter than the shared workflow's rule 1.
+# The suite boots seven fake upstreams on ephemeral ports and needs no database — which is what
+# makes the degradation suite runnable at all, since it needs to KILL upstreams.
+# ────────────────────────────────────────────────────────────────────────────────────────────────
 
 on:
   push:
@@ -30,18 +34,56 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
+  estate:
+    uses: cloudsforge-online/micro-org/.github/workflows/service-ci.yml@main
+    with:
+      service: hub-api
+      port: 4000
+      # This service owns no database and must never acquire one. With `postgres: false` the
+      # workflow starts no container, exports no DSN, and its image smoke test skips the migrator
+      # step — which is correct here, because there is no src/migrator.ts to run.
+      postgres: false
+      # The image smoke test boots the real service, and src/env.ts validates its configuration at
+      # import — so the container needs every variable it declares or it exits before it can serve
+      # /livez. CI-only NON-secrets: each HUB_*_TOKEN only has to clear the 24-character length
+      # check, and the seven upstream URLs are never dialled because /livez calls no upstream.
+      # Never a real credential.
+      #
+      # There are six distinct tokens here and not one shared one, deliberately: AD-05, and the
+      # `controls` job below fails the build if a single shared credential is ever introduced.
+      smoke-env: |
+        IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
+        IDENTITY_ISSUER=http://127.0.0.1:4001
+        IDENTITY_URL=http://127.0.0.1:4001
+        LEDGER_URL=http://127.0.0.1:4004
+        WALLET_URL=http://127.0.0.1:4005
+        BILLING_URL=http://127.0.0.1:4009
+        ACTIVITY_URL=http://127.0.0.1:4010
+        PRICING_URL=http://127.0.0.1:4007
+        POLICY_URL=http://127.0.0.1:4011
+        HUB_LEDGER_TOKEN=ci-only-not-a-real-token-0000000000000
+        HUB_WALLET_TOKEN=ci-only-not-a-real-token-1111111111111
+        HUB_BILLING_TOKEN=ci-only-not-a-real-token-2222222222222
+        HUB_ACTIVITY_TOKEN=ci-only-not-a-real-token-3333333333333
+        HUB_PRICING_TOKEN=ci-only-not-a-real-token-4444444444444
+        HUB_POLICY_TOKEN=ci-only-not-a-real-token-5555555555555
+    secrets:
+      # @cloudsforge/* resolves through link:../runtime and link:../contracts rather than a
+      # registry, so the workflow checks out micro-runtime and micro-contracts as siblings. Both are
+      # private, so it needs a contents:read token.
+      estate_token: ${{ secrets.ESTATE_READ_TOKEN }}
+    permissions:
+      contents: read
+      packages: read
+
+  controls:
+    name: The controls this service exists to add
     runs-on: ubuntu-latest
-    # No `services:` block. This service has no database, and its tests boot seven fake upstreams
-    # on ephemeral ports rather than requiring a peer to be running — which is what makes the
-    # degradation suite runnable at all: it needs to *kill* upstreams.
     steps:
-      # Temporary: the three checkouts and the sibling layout exist only because the runtime and
-      # contracts packages are unpublished. On publish this collapses to one checkout with no
-      # `path:`.
       - uses: actions/checkout@v4
-        with:
-          path: hub-api
+        with: { path: hub-api }
+      # Temporary, and for the same reason as the Dockerfile's two named build contexts: the runtime
+      # and contracts packages are unpublished and resolve through link:.
       - uses: actions/checkout@v4
         with:
           repository: cloudsforge-online/micro-runtime
@@ -53,47 +95,10 @@ jobs:
           path: contracts
           token: ${{ secrets.ESTATE_READ_TOKEN }}
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.9.0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: hub-api/pnpm-lock.yaml
-
-      # `link:` resolves to the sibling's own node_modules, so the siblings must be installed
-      # before this repository is — without this, `tsc` cannot resolve the sibling source it
-      # typechecks (jose, @opentelemetry/api, @cloudsforge/contracts-chain) and `tsx` cannot load
-      # @cloudsforge/* at run time.
-      - name: Install the sibling runtime and contracts
-        run: |
-          set -euo pipefail
-          pnpm --dir runtime install --frozen-lockfile
-          pnpm --dir contracts install --frozen-lockfile
-
-      - name: Install
-        working-directory: hub-api
-        run: pnpm install --frozen-lockfile
-
-      - name: Typecheck
-        working-directory: hub-api
-        run: pnpm typecheck
-
-      - name: Test
-        working-directory: hub-api
-        run: pnpm test
-
-  # The estate-wide rules from docs/ecosystem/03 §2, as checks rather than as review discipline.
-  rules:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
       - name: 'Rule 1 — this service owns no database, and may not acquire one'
-        # Stricter than the template's version of this rule, and deliberately: the template allows
-        # its own connection string, and this service allows none at all. A BFF with a table is a
-        # BFF holding a stale copy of somebody else's truth.
+        # Stricter than the shared workflow's rule 1, and deliberately: that rule allows a service
+        # its OWN connection string, and this service is allowed none at all.
+        working-directory: hub-api
         run: |
           if grep -rnE '[A-Z_]*DATABASE_URL' src/ --include='*.ts'; then
             echo '::error::hub-api owns no state; a connection string must not appear in src/'
@@ -103,24 +108,23 @@ jobs:
             echo '::error::a connection string appears in src/'
             exit 1
           fi
-
-      - name: 'Rule 4 — livez, readyz and metrics exist'
-        run: |
-          for endpoint in /livez /readyz /metrics; do
-            grep -q "path: '$endpoint'" src/server.ts \
-              || { echo "::error::$endpoint is not served"; exit 1; }
-          done
+          echo 'ok: this service owns no database'
 
       - name: 'Rule 8 — every background timer is a leased job'
+        # The shared workflow bans setInterval. This repository bans setTimeout too: a BFF's
+        # fan-out deadlines belong to the HTTP client's own timeout, not to a hand-rolled timer.
+        working-directory: hub-api
         run: |
           if grep -rnE '\bset(Interval|Timeout)\(' src/ --include='*.ts'; then
             echo '::error::a timer was found; background work is a leased job (@cloudsforge/jobs)'
             exit 1
           fi
+          echo 'ok: no timers'
 
       - name: 'Every upstream is reached with its own credential'
         # AD-05: the BFF holds a scoped credential per upstream. One shared token would make a
         # compromise of the estate's highest-fan-out surface a compromise of all seven peers.
+        working-directory: hub-api
         run: |
           for name in LEDGER WALLET BILLING ACTIVITY PRICING POLICY; do
             grep -q "HUB_${name}_TOKEN" src/env.ts \
@@ -130,59 +134,51 @@ jobs:
             echo '::error::a single shared upstream credential was introduced'
             exit 1
           fi
+          echo 'ok: one credential per upstream'
 
       - name: 'Every dashboard tile carries a status'
         # The exit criterion of Phase 6, as a check. A tile added without an entry in TILE_SOURCES
         # is a tile the degradation suite cannot reason about.
+        working-directory: hub-api
         run: |
           grep -q "export const TILE_SOURCES" src/dashboard.ts \
             || { echo '::error::TILE_SOURCES is gone; the degradation suite has nothing to assert against'; exit 1; }
           grep -q "hub_tile_status_total" src/server.ts \
             || { echo '::error::the tile status metric is not registered'; exit 1; }
+          echo 'ok: every tile carries a status'
 
-  docker:
-    runs-on: ubuntu-latest
-    steps:
-      # Temporary, and for the same reason as above.
-      - uses: actions/checkout@v4
-        with:
-          path: hub-api
-      - uses: actions/checkout@v4
-        with:
-          repository: cloudsforge-online/micro-runtime
-          path: runtime
-          token: ${{ secrets.ESTATE_READ_TOKEN }}
-      - uses: actions/checkout@v4
-        with:
-          repository: cloudsforge-online/micro-contracts
-          path: contracts
-          token: ${{ secrets.ESTATE_READ_TOKEN }}
-
+      # The two image checks the shared workflow does not make. A job cannot see another job's
+      # docker daemon, so the image is rebuilt here — against the same GHA cache the `estate` job's
+      # image build writes.
       - uses: docker/setup-buildx-action@v3
-
       - name: Build the image
         uses: docker/build-push-action@v6
         with:
           context: hub-api
-          # Temporary: drops out with the link: dependencies.
           build-contexts: |
             runtimepkgs=runtime
             contractspkgs=contracts
           push: false
           load: true
-          tags: hub-api:${{ github.sha }}
+          tags: hub-api:hygiene
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: 'The image must not run as root'
+        # Read off the BUILT IMAGE rather than grepped out of the Dockerfile: a USER line in a stage
+        # that is not the final one reads identically in the file and has no effect whatsoever.
         run: |
-          user=$(docker image inspect hub-api:${{ github.sha }} --format '{{.Config.User}}')
+          user=$(docker image inspect hub-api:hygiene --format '{{.Config.User}}')
           [ "$user" = "node" ] || { echo "::error::image runs as '${user:-root}'"; exit 1; }
+          echo "ok: the image runs as ${user}"
 
       - name: 'The image must not carry a secret'
+        # This service holds six upstream credentials. An ENV line would bake one into the image and
+        # send it to every registry that mirrors it; the deploy supplies all six at run time.
         run: |
-          if docker image inspect hub-api:${{ github.sha }} --format '{{json .Config.Env}}' \
+          if docker image inspect hub-api:hygiene --format '{{json .Config.Env}}' \
              | grep -iE 'secret|token|password|key'; then
             echo '::error::a secret-shaped value is baked into the image environment'
             exit 1
           fi
+          echo 'ok: no secret-shaped value in the image environment'
