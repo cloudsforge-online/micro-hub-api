@@ -51,6 +51,7 @@ import {
 import type { AssetCode, Network } from '@cloudsforge/contracts-chain'
 import type { LedgerAssetCode } from '@cloudsforge/contracts-money'
 import type { Metrics } from '@cloudsforge/telemetry'
+import type { LiveScope } from '@cloudsforge/contracts-auth'
 import type { Env } from './env.ts'
 
 /* ------------------------------------------------------------------ cache policy */
@@ -392,15 +393,53 @@ export interface HttpUpstreamOptions {
  *
  * Identity is absent by construction: `GET /auth/me` and `GET /mfa/factors` refuse a service token
  * outright, so those calls carry the caller's own bearer. See the file header.
+ *
+ * ── `satisfies`, NOT AN ANNOTATION, AND THAT IS LOAD-BEARING TWICE ───────────────────────────
+ *
+ * These are OUTBOUND demands — what hub-api presents to each peer — and that direction had never
+ * been checked by anything. `service-ci.yml`'s scope audit reads a repository's INBOUND route
+ * gates, which is how `micro-market` came to declare `policy:evaluate` and `micro-wallet`
+ * `custody:address`, neither of which has ever been a registry key, for the life of both
+ * services. `micro-deploy`'s `derive-grants.mjs` reads this object into
+ * `IDENTITY_SERVICE_TOKEN_GRANTS`, and identity validates that list against the registry at
+ * import and REFUSES TO START on a name it does not know: a dead identity container, so no tokens
+ * for anybody rather than one broken tile.
+ *
+ * `LiveScope` rather than `Scope` because `Scope` is `keyof typeof SCOPES` — every registered key,
+ * DEPRECATED ones included — and identity will not mint a deprecated scope either.
+ * `LiveScope = Exclude<Scope, DeprecatedScope>`, with `DeprecatedScope` computed FROM `SCOPES` by
+ * a conditional type over the `deprecated` field rather than hand-listed
+ * (`contracts/packages/auth/src/index.ts:507`), so it cannot drift from the registry.
+ *
+ * It has to be `satisfies` rather than a type annotation, because this object's KEYS are also a
+ * type: `UpstreamProviders` below is `Record<keyof typeof UPSTREAM_SCOPES, …>`. Annotating this
+ * `Record<string, readonly LiveScope[]>` would widen that key set to `string`, and every peer
+ * lookup in this file would stop being checked — trading a narrow win on the values for a much
+ * larger loss on the keys. `satisfies` checks the values and keeps the literal keys.
+ *
+ * ── AND WHY EACH INNER ARRAY CARRIES `as const` ──────────────────────────────────────────────
+ *
+ * **The clause that stood here before checked nothing.** It read
+ * `satisfies Record<string, readonly string[]>`, and `Object.freeze(['ledger:read'])` is typed
+ * `readonly string[]` — the array literal is widened, because `Object.freeze` gives it no const
+ * context. So the clause asserted `readonly string[]` against `readonly string[]`: true for every
+ * possible value, including `'poilcy:decide'`. Six outbound demands at the estate's highest
+ * fan-out surface looked type-checked and were not, which is exactly the shape that let
+ * `policy:evaluate` and `custody:address` ship in two sibling services.
+ *
+ * `as const` is what makes the elements literal types, and therefore what makes the `satisfies`
+ * above capable of failing at all. Without it, swapping any scope here for a name that does not
+ * exist still compiles. Verified by doing precisely that, in both directions — an unregistered
+ * scope and a registered-but-deprecated one — before and after.
  */
 export const UPSTREAM_SCOPES = Object.freeze({
-  ledger: Object.freeze(['ledger:read']),
-  wallet: Object.freeze(['wallet:read']),
-  billing: Object.freeze(['billing:read']),
-  activity: Object.freeze(['notify:read']),
-  pricing: Object.freeze(['pricing:read']),
-  policy: Object.freeze(['policy:decide']),
-}) satisfies Record<string, readonly string[]>
+  ledger: Object.freeze(['ledger:read'] as const),
+  wallet: Object.freeze(['wallet:read'] as const),
+  billing: Object.freeze(['billing:read'] as const),
+  activity: Object.freeze(['notify:read'] as const),
+  pricing: Object.freeze(['pricing:read'] as const),
+  policy: Object.freeze(['policy:decide'] as const),
+}) satisfies Record<string, readonly LiveScope[]>
 
 /** The providers, exposed so `/readyz` can report the credential and a test can drive them. */
 export type UpstreamProviders = Readonly<
