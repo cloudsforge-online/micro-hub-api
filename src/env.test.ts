@@ -6,7 +6,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-const TOKEN = 'hub-api-test-token-0000000000000000'
+const CREDENTIAL = 'cfsc_a-long-lived-credential-that-does-not-expire'
 
 /**
  * A valid environment, applied to the process before `./env.ts` is imported.
@@ -26,21 +26,16 @@ const BASE: Record<string, string> = {
   ACTIVITY_URL: 'http://127.0.0.1:4005',
   PRICING_URL: 'http://127.0.0.1:4006',
   POLICY_URL: 'http://127.0.0.1:4007',
-  HUB_LEDGER_TOKEN: TOKEN,
-  HUB_WALLET_TOKEN: TOKEN,
-  HUB_BILLING_TOKEN: TOKEN,
-  HUB_ACTIVITY_TOKEN: TOKEN,
-  HUB_PRICING_TOKEN: TOKEN,
-  HUB_POLICY_TOKEN: TOKEN,
 }
 for (const [key, value] of Object.entries(BASE)) process.env[key] = value
 
 const { EnvError, SERVICE, env, loadEnv } = await import('./env.ts')
+const { UPSTREAM_SCOPES } = await import('./upstreams.ts')
 
 test('a complete environment loads, and importing the module did not exit', () => {
   assert.equal(SERVICE, 'hub-api')
   assert.equal(env.upstreams.ledger, BASE['LEDGER_URL'])
-  assert.equal(env.tokens.pricing, TOKEN)
+  assert.equal(env.identityCredential, null, 'not in BASE — it is optional by design')
 })
 
 test('the defaults are the documented ones', () => {
@@ -61,12 +56,15 @@ test('a missing variable names itself', () => {
   })
 })
 
-test('there are six upstream tokens and no seventh', () => {
-  // Identity is called with the caller's own bearer, because `/auth/me` and `/mfa/factors` refuse
-  // a service token outright. A `HUB_IDENTITY_TOKEN` would be a credential that cannot be used,
-  // and a credential nobody can use is one nobody rotates.
-  const env = loadEnv(BASE)
-  assert.deepEqual(Object.keys(env.tokens).sort(), [
+test('there are six upstream SCOPE SETS and no seventh', () => {
+  // This used to assert six token VARIABLES. There is now one credential and six scope sets, which
+  // is the same separation held one layer down: identity reads the service off the credential row,
+  // so the scope set is a request parameter rather than a second secret.
+  //
+  // Identity is still absent by construction, because `/auth/me` and `/mfa/factors` refuse a
+  // service token outright. A seventh scope set would be one that cannot be used, and a credential
+  // nobody can use is one nobody rotates.
+  assert.deepEqual(Object.keys(UPSTREAM_SCOPES).sort(), [
     'activity',
     'billing',
     'ledger',
@@ -74,19 +72,30 @@ test('there are six upstream tokens and no seventh', () => {
     'pricing',
     'wallet',
   ])
+  // Each is exactly one scope, and none of them is a wildcard: this is the highest fan-out surface
+  // in the estate, so a token here reads one thing or it is too wide.
+  for (const [peer, scopes] of Object.entries(UPSTREAM_SCOPES)) {
+    assert.equal(scopes.length, 1, `${peer} asks for more than one scope`)
+    assert.doesNotMatch(scopes[0] ?? '', /\*/, `${peer} asks for a wildcard scope`)
+  }
 })
 
 test('a placeholder credential is refused outright', () => {
   // A default secret in source is not convenient, it is catastrophic: a placeholder that boots is
   // a placeholder that reaches production.
   assert.throws(
-    () => loadEnv({ ...BASE, HUB_PRICING_TOKEN: 'changeme' }),
-    /HUB_PRICING_TOKEN is set to a known placeholder/,
+    () => loadEnv({ ...BASE, HUB_API_IDENTITY_CREDENTIAL: 'changeme' }),
+    /HUB_API_IDENTITY_CREDENTIAL is set to a known placeholder/,
   )
 })
 
 test('a short credential is refused', () => {
-  assert.throws(() => loadEnv({ ...BASE, HUB_POLICY_TOKEN: 'short' }), /at least 24 characters/)
+  // HUB_POLICY_TOKEN was the subject here; it is retired, and the credential that replaced all six
+  // takes the same length floor for the same reason.
+  assert.throws(
+    () => loadEnv({ ...BASE, HUB_API_IDENTITY_CREDENTIAL: 'short' }),
+    /at least 24 characters/,
+  )
 })
 
 test('an upstream deadline above the page budget is refused at boot', () => {
@@ -108,4 +117,35 @@ test('no database url is read, and none may be added', () => {
   // here would be the first step towards a table holding a stale copy of somebody else truth.
   const env = loadEnv(BASE)
   assert.ok(!('databaseUrl' in env), 'hub-api owns no state and must read no connection string')
+})
+
+/* ────────────────────────────────────────────────────────────────────────────────────────────────
+ * The one credential that replaced six tokens.
+ * ──────────────────────────────────────────────────────────────────────────────────────────────── */
+
+test('the identity credential is read, and its absence is a null rather than a throw', () => {
+  assert.equal(
+    loadEnv({ ...BASE, HUB_API_IDENTITY_CREDENTIAL: CREDENTIAL }).identityCredential,
+    CREDENTIAL,
+  )
+  // Absent must LOAD — the image has to boot without one so the CI smoke test can read /livez —
+  // and is caught by the hard `identity-credential` readiness probe instead.
+  assert.equal(loadEnv(BASE).identityCredential, null)
+})
+
+test('any of the six retired tokens being set is reported rather than obeyed', () => {
+  assert.equal(loadEnv(BASE).legacyServiceTokenPresent, false)
+  for (const name of [
+    'HUB_LEDGER_TOKEN',
+    'HUB_WALLET_TOKEN',
+    'HUB_BILLING_TOKEN',
+    'HUB_ACTIVITY_TOKEN',
+    'HUB_PRICING_TOKEN',
+    'HUB_POLICY_TOKEN',
+  ]) {
+    const env = loadEnv({ ...BASE, [name]: 'a-real-looking-token-of-sufficient-length' })
+    assert.equal(env.legacyServiceTokenPresent, true, `${name} was not noticed`)
+    // And it confers nothing: setting it must not make the service look configured.
+    assert.equal(env.identityCredential, null)
+  }
 })

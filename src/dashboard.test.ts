@@ -150,6 +150,23 @@ test('notifications report themselves unavailable rather than being synthesised'
 for (const dead of UPSTREAM_NAMES) {
   test(`${dead} down costs its own tiles and nothing else`, async () => {
     await withHub({}, async (h) => {
+      // MINT FIRST, THEN KILL — and only the token, not the tiles.
+      //
+      // Every peer client now obtains its bearer by exchanging a credential at identity, so a
+      // replica that has never minted and then finds identity dead cannot call ANY peer. That is
+      // inherent: you cannot authenticate to anyone while the thing that authenticates you is
+      // down, and it is the same for every service in the estate.
+      //
+      // The property this test is about is the one that still holds and is the one that matters in
+      // production: a token identity has ALREADY signed does not stop being valid because identity
+      // went down, so a warm replica loses identity's own tiles and nothing else. Warming through
+      // the providers rather than through a dashboard request is deliberate — a warm-up request
+      // would populate the tile caches and the assertions below would pass on stale data instead
+      // of on live degradation.
+      await Promise.all(
+        Object.values(h.upstreams.tokenProviders).map((provider) => provider?.token()),
+      )
+
       await h.estate.services[dead].kill()
 
       const res = await get(h, '/v1/dashboard')

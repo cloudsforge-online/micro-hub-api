@@ -77,6 +77,26 @@ function requiredSecret(source: Source, name: string, minLength = 24): string {
   return value
 }
 
+/**
+ * A secret that may be absent, but must be real if present.
+ *
+ * The distinction matters for the identity credential: absent is a deployment that has not been
+ * given one yet and is reported by `/readyz`; a short placeholder is a deployment that believes it
+ * HAS one, and would fail on its first call to a peer with a 401 that reads as "the peer rejected
+ * hub-api" rather than "nobody set this variable".
+ */
+function optionalSecret(source: Source, name: string, minLength = 24): string | null {
+  const value = source[name]?.trim()
+  if (!value) return null
+  if (PLACEHOLDERS.has(value.toLowerCase())) {
+    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
+  }
+  if (value.length < minLength) {
+    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
+  }
+  return value
+}
+
 function optional(source: Source, name: string, fallback: string): string {
   const value = source[name]?.trim()
   return value && value.length > 0 ? value : fallback
@@ -103,18 +123,6 @@ export interface UpstreamUrls {
   readonly policy: string
 }
 
-/**
- * One credential per upstream. Identity is absent by construction — see the file header.
- */
-export interface UpstreamTokens {
-  readonly ledger: string
-  readonly wallet: string
-  readonly billing: string
-  readonly activity: string
-  readonly pricing: string
-  readonly policy: string
-}
-
 export interface Env {
   readonly port: number
   readonly env: string
@@ -123,7 +131,32 @@ export interface Env {
   readonly identityJwksUrl: string
   readonly identityIssuer: string
   readonly upstreams: UpstreamUrls
-  readonly tokens: UpstreamTokens
+  /**
+   * **The one long-lived credential this service exchanges for six short-lived tokens.**
+   *
+   * It replaces `HUB_LEDGER_TOKEN`, `HUB_WALLET_TOKEN`, `HUB_BILLING_TOKEN`,
+   * `HUB_ACTIVITY_TOKEN`, `HUB_PRICING_TOKEN` and `HUB_POLICY_TOKEN` — six 600-second tokens
+   * (identity/src/tokens.ts:28) read once at boot. Ten minutes into any deployment all six expired
+   * and every tile on the dashboard went `unavailable`; nothing could re-mint them, because
+   * minting requires the `admin` role.
+   *
+   * ONE SECRET, STILL SIX NARROW TOKENS. The six variables existed because they carry different
+   * scopes — this is the highest fan-out surface in the estate, and `wallet:read` and nothing else
+   * is the whole point of AD-05. That separation is kept: identity reads the service off the
+   * credential ROW and never off the request, so one credential mints everything hub-api is
+   * allowed, and the scope set is a request parameter rather than a second secret. Six providers,
+   * six caches, six narrow tokens, one revocable secret.
+   *
+   * Identity is still absent by construction — see the file header. Its two routes refuse a
+   * service token, so those calls carry the caller's own bearer.
+   *
+   * OPTIONAL, so the image can BOOT for CI's `/livez` smoke test, whose environment is fixed in a
+   * workflow file. The absence is not silent: `/readyz` reports `identity-credential` as a HARD
+   * failure and every upstream call fails closed with 503.
+   */
+  readonly identityCredential: string | null
+  /** Whether any of the six retired `HUB_*_TOKEN` variables is still set. Reported at boot. */
+  readonly legacyServiceTokenPresent: boolean
   /**
    * The ceiling on a whole dashboard request.
    *
@@ -189,14 +222,17 @@ export function loadEnv(source: Source = process.env, hostname = ''): Env {
       pricing: required(source, 'PRICING_URL'),
       policy: required(source, 'POLICY_URL'),
     },
-    tokens: {
-      ledger: requiredSecret(source, 'HUB_LEDGER_TOKEN'),
-      wallet: requiredSecret(source, 'HUB_WALLET_TOKEN'),
-      billing: requiredSecret(source, 'HUB_BILLING_TOKEN'),
-      activity: requiredSecret(source, 'HUB_ACTIVITY_TOKEN'),
-      pricing: requiredSecret(source, 'HUB_PRICING_TOKEN'),
-      policy: requiredSecret(source, 'HUB_POLICY_TOKEN'),
-    },
+    // Not `requiredSecret`: see the field comment. The absence is caught by `/readyz`, which is a
+    // check that can fail, rather than by a boot CI cannot perform.
+    identityCredential: optionalSecret(source, 'HUB_API_IDENTITY_CREDENTIAL'),
+    legacyServiceTokenPresent: [
+      'HUB_LEDGER_TOKEN',
+      'HUB_WALLET_TOKEN',
+      'HUB_BILLING_TOKEN',
+      'HUB_ACTIVITY_TOKEN',
+      'HUB_PRICING_TOKEN',
+      'HUB_POLICY_TOKEN',
+    ].some((name) => (source[name]?.trim() ?? '').length > 0),
     dashboardDeadlineMs,
     upstreamDeadlineMs,
     circuitThreshold: integer(source, 'HUB_CIRCUIT_THRESHOLD', 5, 1, 100),

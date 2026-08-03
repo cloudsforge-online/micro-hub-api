@@ -495,6 +495,24 @@ export async function startEstate(): Promise<Estate> {
       return null
     }),
     identity: new FakeService('identity', (url) => {
+      // The credential exchange. Every peer client now obtains its token here rather than reading
+      // one from the environment, so the fake identity has to be able to mint — a fixture that
+      // could not would leave the whole suite exercising a path production does not take.
+      //
+      // The token it answers with is opaque to this estate: the fake peers below accept any
+      // bearer, because what these tests are about is composition and degradation, not the peers'
+      // own authorisation. `servicetoken.test.ts` is where a REAL Verifier decides.
+      if (url.pathname === '/service-tokens/exchange') {
+        return {
+          status: 201,
+          body: {
+            token: 'hub-api-test-token-0000000000000000',
+            service: 'hub-api',
+            scopes: [],
+            expiresIn: 600,
+          },
+        }
+      }
       if (url.pathname === '/auth/me') return { status: 200, body: FIXTURES.identityMe }
       if (url.pathname === '/mfa/factors') return { status: 200, body: FIXTURES.identityFactors }
       return null
@@ -552,7 +570,10 @@ export async function startEstate(): Promise<Estate> {
  */
 export function estateEnv(estate: Estate, overrides: Partial<Env> = {}): Env {
   const url = (name: UpstreamName) => estate.services[name].url
-  const token = 'hub-api-test-token-0000000000000000'
+  // A real-shaped credential: ServiceTokenProvider refuses anything not prefixed `cfsc_`,
+  // because a container handed a TOKEN where a credential belongs is the defect it exists to
+  // prevent, arriving ten minutes later.
+  const token = 'cfsc_a-test-credential-that-does-not-expire'
   return {
     port: 0,
     env: 'test',
@@ -569,14 +590,8 @@ export function estateEnv(estate: Estate, overrides: Partial<Env> = {}): Env {
       pricing: url('pricing'),
       policy: url('policy'),
     },
-    tokens: {
-      ledger: token,
-      wallet: token,
-      billing: token,
-      activity: token,
-      pricing: token,
-      policy: token,
-    },
+    identityCredential: token,
+    legacyServiceTokenPresent: false,
     dashboardDeadlineMs: 2_000,
     upstreamDeadlineMs: 1_000,
     circuitThreshold: 5,

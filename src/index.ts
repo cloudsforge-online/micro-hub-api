@@ -22,7 +22,7 @@
  * must not declare them.
  */
 
-import { Verifier } from '@cloudsforge/auth'
+import { Verifier, serviceTokenProbe } from '@cloudsforge/auth'
 import { Lifecycle, httpProbe, installSignalHandlers } from '@cloudsforge/lifecycle'
 import { Logger, Metrics, registerHttpMetrics } from '@cloudsforge/telemetry'
 import { TtlCache } from './cache.ts'
@@ -53,7 +53,43 @@ logger.info('starting', {
 // 3. The upstream clients, before the Lifecycle, because the readiness report closes over their
 //    breaker state. One client per peer: `@cloudsforge/http` scopes its circuit breaker to the
 //    client, so sharing one would let a sick pricing service open the circuit on the ledger.
-const upstreams = httpUpstreams({ env, metrics })
+const upstreams = httpUpstreams({
+  env,
+  metrics,
+  onTokenEvent: (event) => {
+    if (event.kind === 'exchange_failed') {
+      // `warn`, not `error`, while a usable token is still held: the 20% slack after the refresh
+      // point exists precisely so a few of these are survivable and uninteresting.
+      const level = event.hadUsableToken ? 'warn' : 'error'
+      logger[level]('service token exchange failed', {
+        err: event.err,
+        hadUsableToken: event.hadUsableToken,
+      })
+    } else if (event.kind === 'minted') {
+      logger.info('service token minted', {
+        service: event.service,
+        expiresIn: event.expiresIn,
+        refreshInMs: event.refreshInMs,
+      })
+    } else {
+      logger.warn('service token', { event: event.kind, url: event.url })
+    }
+  },
+})
+
+if (!upstreams.tokenProviders.ledger) {
+  // Not `fatal` and exit: the image must be able to boot without this so CI's startup smoke test
+  // can read /livez, and a service that refuses to start is a service whose logs nobody reads.
+  // `/readyz` is where the absence is enforced — the `identity-credential` probe below is hard.
+  logger.error('HUB_API_IDENTITY_CREDENTIAL is not set; every tile will be unavailable', {
+    hint: 'deploy/scripts/estate-bootstrap.sh writes it to compose/estate/tokens.env',
+  })
+}
+if (env.legacyServiceTokenPresent) {
+  logger.error('one or more HUB_*_TOKEN variables are set and are IGNORED', {
+    hint: 'all six were 600-second tokens read once at boot; HUB_API_IDENTITY_CREDENTIAL replaces them',
+  })
+}
 
 // 4. The cache. In-process and per-replica, on purpose. A shared cache (Redis, say) would be a
 //    stateful dependency for a stateless service and would make an outage of *it* an outage of
@@ -80,6 +116,14 @@ const lifecycle = new Lifecycle({
 // removes every service from its balancer at once, which is a cascade, not a safety measure.
 lifecycle
   .addProbe(httpProbe('identity-jwks', env.identityJwksUrl, { kind: 'soft' }))
+  // HARD, unlike every upstream probe below. It does not report a peer having a bad minute — it
+  // fails only when no credential is configured at all, which is a deployment whose every tile is
+  // unavailable and which will not fix itself. An identity OUTAGE returns warn, deliberately: a
+  // hard fail there would empty every balancer in the estate over one bad minute in identity.
+  //
+  // Any one provider answers for all six: they are built together from the same credential, so
+  // either all are present or none is.
+  .addProbe(serviceTokenProbe(upstreams.tokenProviders.ledger))
   .addProbe(httpProbe('ledger', `${env.upstreams.ledger.replace(/\/+$/, '')}/livez`, { kind: 'soft' }))
   .addProbe(httpProbe('wallet', `${env.upstreams.wallet.replace(/\/+$/, '')}/livez`, { kind: 'soft' }))
   .addProbe(httpProbe('pricing', `${env.upstreams.pricing.replace(/\/+$/, '')}/livez`, { kind: 'soft' }))

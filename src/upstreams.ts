@@ -43,6 +43,11 @@
  */
 
 import { HttpClient } from '@cloudsforge/http'
+import {
+  ServiceTokenProvider,
+  ServiceTokenUnavailableError,
+  type ProviderEvent,
+} from '@cloudsforge/auth'
 import type { AssetCode, Network } from '@cloudsforge/contracts-chain'
 import type { LedgerAssetCode } from '@cloudsforge/contracts-money'
 import type { Metrics } from '@cloudsforge/telemetry'
@@ -348,6 +353,14 @@ export interface Upstreams {
   policyFreezes(userId: string, requestId: string): Promise<readonly PolicyFreeze[]>
   /** Breaker state per upstream, for `/readyz` and for the operator who asks "is it us". */
   circuitStates(): Readonly<Record<string, string>>
+  /**
+   * The six token providers, so `/readyz` can report the credential.
+   *
+   * Every entry is `null` when no credential is configured, which is the state
+   * `serviceTokenProbe` fails on. They are exposed rather than hidden because a dashboard whose
+   * tiles are all `unavailable` should say WHY on the readiness endpoint, not only in a log.
+   */
+  readonly tokenProviders: UpstreamProviders
 }
 
 /** How many rows each list read asks for. See `dashboard.ts` for why the dashboard asks for few. */
@@ -365,7 +378,34 @@ export interface HttpUpstreamOptions {
   readonly metrics: Metrics
   /** Test seam. Production uses the global. */
   readonly fetch?: typeof globalThis.fetch
+  readonly onTokenEvent?: (event: ProviderEvent) => void
 }
+
+/**
+ * The exact scope each peer is asked for, and nothing wider.
+ *
+ * These are the six scope sets the six retired `HUB_*_TOKEN` variables carried, read off the
+ * tokens the estate bootstrap actually minted rather than inferred. They stay separate because
+ * this is the highest fan-out surface in the estate: an attacker who reaches this process's memory
+ * should find six narrow read tokens, not one that can move money. That is AD-05, and dropping to
+ * a single whole-allowlist token would quietly trade it away.
+ *
+ * Identity is absent by construction: `GET /auth/me` and `GET /mfa/factors` refuse a service token
+ * outright, so those calls carry the caller's own bearer. See the file header.
+ */
+export const UPSTREAM_SCOPES = Object.freeze({
+  ledger: Object.freeze(['ledger:read']),
+  wallet: Object.freeze(['wallet:read']),
+  billing: Object.freeze(['billing:read']),
+  activity: Object.freeze(['notify:read']),
+  pricing: Object.freeze(['pricing:read']),
+  policy: Object.freeze(['policy:decide']),
+}) satisfies Record<string, readonly string[]>
+
+/** The providers, exposed so `/readyz` can report the credential and a test can drive them. */
+export type UpstreamProviders = Readonly<
+  Record<keyof typeof UPSTREAM_SCOPES, ServiceTokenProvider | null>
+>
 
 /**
  * Build the seven clients.
@@ -379,15 +419,57 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
   const { env, metrics } = options
   const circuit = { threshold: env.circuitThreshold, resetMs: env.circuitResetMs }
 
-  const make = (name: string, baseUrl: string, token?: string): HttpClient =>
+  /**
+   * One provider per peer, all from the SAME credential, each narrowed to that peer's scope.
+   *
+   * Six providers rather than one is deliberate: a single whole-allowlist token would be one
+   * string in this process's memory that reads wallets, ledgers, billing and policy at once. Six
+   * exchanges every ten minutes against identity is a trivial cost for keeping AD-05's separation.
+   */
+  const providers: UpstreamProviders = Object.freeze(
+    Object.fromEntries(
+      Object.entries(UPSTREAM_SCOPES).map(([peer, scopes]) => [
+        peer,
+        env.identityCredential
+          ? new ServiceTokenProvider({
+              identityUrl: env.upstreams.identity,
+              credential: env.identityCredential,
+              scopes,
+              ...(options.fetch ? { fetch: options.fetch } : {}),
+              ...(options.onTokenEvent ? { onEvent: options.onTokenEvent } : {}),
+            })
+          : null,
+      ]),
+    ),
+  ) as UpstreamProviders
+
+  /**
+   * Rejects rather than resolving `undefined` when there is no credential. `HttpClient` omits the
+   * header entirely for `undefined`, so the request would go out unauthenticated and come back
+   * 401 — telling an operator that the peer rejected hub-api, when the truth is that nobody
+   * configured hub-api. `ServiceTokenUnavailableError` is 503 under `statusFor`, which is what a
+   * tile reports as `unavailable` rather than as a signed-out user.
+   */
+  const tokenFrom = (provider: ServiceTokenProvider | null) => (): Promise<string> =>
+    provider
+      ? provider.token()
+      : Promise.reject(new ServiceTokenUnavailableError('no identity credential is configured'))
+
+  const make = (name: string, baseUrl: string, provider?: ServiceTokenProvider | null): HttpClient =>
     new HttpClient({
       baseUrl,
       name,
       defaultDeadlineMs: env.upstreamDeadlineMs,
       defaultRetries: 1,
       circuit,
-      ...(token !== undefined ? { token: () => token } : {}),
-      ...(options.fetch ? { fetch: options.fetch } : {}),
+      ...(provider !== undefined ? { token: tokenFrom(provider) } : {}),
+      // `authorizedFetch` catches a 401 from the peer, re-mints and replays once — the schedule
+      // rests on this process's clock and the peer's expiry on the peer's.
+      ...(provider?.authorizedFetch
+        ? { fetch: provider.authorizedFetch }
+        : options.fetch
+          ? { fetch: options.fetch }
+          : {}),
       // The per-attempt timing. Recorded here rather than around the call so a retried request
       // shows two observations, which is what makes "slow because we retried" separable from
       // "slow because the peer is slow".
@@ -396,14 +478,14 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
       },
     })
 
-  const ledger = make('ledger', env.upstreams.ledger, env.tokens.ledger)
-  const wallet = make('wallet', env.upstreams.wallet, env.tokens.wallet)
+  const ledger = make('ledger', env.upstreams.ledger, providers.ledger)
+  const wallet = make('wallet', env.upstreams.wallet, providers.wallet)
   // No token: every call carries the caller's own, per request. See the file header.
   const identity = make('identity', env.upstreams.identity)
-  const billing = make('billing', env.upstreams.billing, env.tokens.billing)
-  const activity = make('activity', env.upstreams.activity, env.tokens.activity)
-  const pricing = make('pricing', env.upstreams.pricing, env.tokens.pricing)
-  const policy = make('policy', env.upstreams.policy, env.tokens.policy)
+  const billing = make('billing', env.upstreams.billing, providers.billing)
+  const activity = make('activity', env.upstreams.activity, providers.activity)
+  const pricing = make('pricing', env.upstreams.pricing, providers.pricing)
+  const policy = make('policy', env.upstreams.policy, providers.policy)
 
   return {
     async ledgerBalances(userId, requestId) {
@@ -512,5 +594,6 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
         policy: policy.circuitState,
       }
     },
+    tokenProviders: providers,
   }
 }
