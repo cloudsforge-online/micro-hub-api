@@ -3,6 +3,8 @@
 The Forge Hub backend-for-frontend. It composes the dashboard from seven services in one
 authenticated call, degrades one tile at a time, and **owns no state**.
 
+Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md)
+
 Per AD-05 in `docs/ecosystem/02-target-architecture.md`: Hub is a separate application from the
 identity service because "a dashboard tweak redeploys the token issuer" otherwise, and it is a BFF
 rather than a fat client because ten cross-origin round trips with ten token exchanges is "a bad
@@ -117,3 +119,10 @@ None is worked around, because working around a missing route is how a BFF acqui
 7. **Pricing's own client disagrees with pricing.** Unrelated to this service but found while
    reading: `wallet/src/pricingclient.ts` calls `GET /v1/quotes`, which pricing does not serve —
    the rate board is `GET /rates`. Worth a look before the next deploy of either.
+
+---
+
+## Provenance
+
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
+human direction and review.
