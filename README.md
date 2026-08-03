@@ -1,6 +1,6 @@
 # cloudsforge-hub-api
 
-[![ci](https://github.com/cloudsforge-online/micro-hub-api/actions/workflows/ci.yml/badge.svg)](https://github.com/cloudsforge-online/micro-hub-api/actions/workflows/ci.yml) [![TypeScript](https://img.shields.io/badge/TypeScript-strict%20ESM-3178C6?logo=typescript&logoColor=white)](./tsconfig.base.json) [![node](https://img.shields.io/badge/node-%3E%3D22-5FA04E?logo=nodedotjs&logoColor=white)](./package.json)
+[![ci](https://github.com/cloudsforge-online/micro-hub-api/actions/workflows/ci.yml/badge.svg)](https://github.com/cloudsforge-online/micro-hub-api/actions/workflows/ci.yml) [![TypeScript](https://img.shields.io/badge/TypeScript-strict%20ESM-3178C6?logo=typescript&logoColor=white)](./tsconfig.base.json) [![node](https://img.shields.io/badge/node-%3E%3D22-5FA04E?logo=nodedotjs&logoColor=white)](./package.json) [![licence](https://img.shields.io/badge/licence-MIT-blue)](./LICENSE)
 
 The Forge Hub backend-for-frontend. It composes the dashboard from seven services in one
 authenticated call, degrades one tile at a time, and **owns no state**.
