@@ -1,5 +1,7 @@
 # cloudsforge-hub-api
 
+[![ci](https://github.com/cloudsforge-online/micro-hub-api/actions/workflows/ci.yml/badge.svg)](https://github.com/cloudsforge-online/micro-hub-api/actions/workflows/ci.yml) [![TypeScript](https://img.shields.io/badge/TypeScript-strict%20ESM-3178C6?logo=typescript&logoColor=white)](./tsconfig.base.json) [![node](https://img.shields.io/badge/node-%3E%3D22-5FA04E?logo=nodedotjs&logoColor=white)](./package.json)
+
 The Forge Hub backend-for-frontend. It composes the dashboard from seven services in one
 authenticated call, degrades one tile at a time, and **owns no state**.
 
@@ -124,5 +126,5 @@ None is worked around, because working around a missing route is how a BFF acqui
 
 ## Provenance
 
-The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
-human direction and review.
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, assets
+generated with **FLUX 2 Pro**, under human direction and review.
