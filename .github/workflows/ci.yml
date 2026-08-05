@@ -45,12 +45,31 @@ jobs:
       postgres: false
       # The image smoke test boots the real service, and src/env.ts validates its configuration at
       # import — so the container needs every variable it declares or it exits before it can serve
-      # /livez. CI-only NON-secrets: each HUB_*_TOKEN only has to clear the 24-character length
-      # check, and the seven upstream URLs are never dialled because /livez calls no upstream.
-      # Never a real credential.
+      # /livez. What is left below is seven upstream URLs that are never dialled, because /livez
+      # calls no upstream. Never a real credential.
       #
-      # There are six distinct tokens here and not one shared one, deliberately: AD-05, and the
-      # `controls` job below fails the build if a single shared credential is ever introduced.
+      # ── THE SIX `HUB_*_TOKEN` LINES ARE GONE, AND THEIR ABSENCE IS THE POINT ─────────────────
+      #
+      # This block used to say each one "only has to clear the 24-character length check". That
+      # sentence is the defect written into configuration — a 24-character floor is exactly what
+      # micro-org #142's 40-character placeholder cleared on 44 containers.
+      #
+      # The six variables are RETIRED. `env.ts` keeps them only as `legacyServiceTokenPresent`, a
+      # presence check it reports and never obeys, and the estate's compose stopped passing them
+      # for the same reason. Supplying them here made every smoke run assert that a retired
+      # variable was configured — and a variable nothing reads is a secret nothing needed.
+      #
+      # The AD-05 separation they carried did not go away with them: it moved into the exchange,
+      # which mints six narrow tokens from one credential. The `controls` job below still fails the
+      # build if a single shared credential is reintroduced as a variable.
+      #
+      # `HUB_API_IDENTITY_CREDENTIAL` is deliberately NOT added in their place. `env.ts` makes it
+      # optional so that THIS job can boot the image without one, `/readyz` — not `/livez` — is
+      # where its absence is enforced, and there is no `@generate` for a `cfsc_` credential because
+      # identity mints those against a row rather than out of `openssl`.
+      #
+      # Nothing here needs `=@generate`: this service reads no `OUTBOX_SIGNING_SECRET`. It owns no
+      # database and publishes no events, so it is on neither side of the estate's event bus.
       smoke-env: |
         IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
         IDENTITY_ISSUER=http://127.0.0.1:4001
@@ -61,12 +80,6 @@ jobs:
         ACTIVITY_URL=http://127.0.0.1:4010
         PRICING_URL=http://127.0.0.1:4007
         POLICY_URL=http://127.0.0.1:4011
-        HUB_LEDGER_TOKEN=ci-only-not-a-real-token-0000000000000
-        HUB_WALLET_TOKEN=ci-only-not-a-real-token-1111111111111
-        HUB_BILLING_TOKEN=ci-only-not-a-real-token-2222222222222
-        HUB_ACTIVITY_TOKEN=ci-only-not-a-real-token-3333333333333
-        HUB_PRICING_TOKEN=ci-only-not-a-real-token-4444444444444
-        HUB_POLICY_TOKEN=ci-only-not-a-real-token-5555555555555
     secrets:
       # @cloudsforge/* resolves through link:../runtime and link:../contracts rather than a
       # registry, so the workflow checks out micro-runtime and micro-contracts as siblings. Both are

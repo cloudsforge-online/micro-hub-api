@@ -6,7 +6,31 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-const CREDENTIAL = 'cfsc_a-long-lived-credential-that-does-not-expire'
+/**
+ * THIS FIXTURE CONTAINS HYPHENS ON PURPOSE, AND THAT IS THE MOST IMPORTANT THING ABOUT IT.
+ *
+ * A credential body is base64**url**, so `-` and `_` are in its alphabet. Measured on the running
+ * estates: the mainnet credential is alphanumeric and the testnet one CONTAINS A HYPHEN. So a
+ * "secrets have no hyphens" rule — correct for a generated HMAC key, and what every placeholder
+ * this estate wrote would have failed — passes mainnet and kills testnet at boot. One environment
+ * healthy, one dead, from a rule that reads as obviously right in review.
+ *
+ * Keeping a hyphenated credential here means that mistake fails CI instead of failing one estate in
+ * production. Do not "tidy" the hyphens out of this value.
+ *
+ * The literal it replaces was `cfsc_a-long-lived-credential-that-does-not-expire`: the right prefix
+ * and the right length, and 3.5 bits per character of entropy — English prose, i.e. a value the
+ * guard is specifically there to refuse. A fixture that could not survive the check it is meant to
+ * demonstrate documents the absence of one.
+ */
+const CREDENTIAL = 'cfsc_TToR-eOeVTDnqhX1-nu6-u7DoCr4MCfa86g4g6kd404'
+
+/**
+ * The shape the six retired `HUB_*_TOKEN` variables held: a 600-second JWT read once at boot.
+ * Fabricated; only the first two segments matter, because the guard refuses on SHAPE and never
+ * decodes. micro-org #222.
+ */
+const JWT = 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJodWItYXBpIiwiZXhwIjoxfQ.notasignature'
 
 /**
  * A valid environment, applied to the process before `./env.ts` is imported.
@@ -83,19 +107,83 @@ test('there are six upstream SCOPE SETS and no seventh', () => {
 test('a placeholder credential is refused outright', () => {
   // A default secret in source is not convenient, it is catastrophic: a placeholder that boots is
   // a placeholder that reaches production.
+  //
+  // THIS ASSERTION USED TO PIN THE STRING "is set to a known placeholder", and that wording was a
+  // defence of the deny-list this work replaces. A deny-list of exact strings cannot work — the
+  // next placeholder somebody writes is by definition not on it — so a test that demanded the
+  // deny-list's own sentence would fail on any fix that stopped using one, including this one.
+  //
+  // What it asserts now is the property: each of these is refused, the variable is named, and the
+  // value is never quoted back into a message a log collector ships. The estate's real defect
+  // (`estate-placeholder-token-…`, on 44 containers as micro-org #142) is in the list precisely
+  // because no deny-list ever contained it.
+  for (const bad of [
+    'changeme',
+    'estate-placeholder-token-0000000000000000',
+    'estate-only-outbox-secret-00000000000000',
+  ]) {
+    assert.throws(
+      () => loadEnv({ ...BASE, HUB_API_IDENTITY_CREDENTIAL: bad }),
+      (err: unknown) =>
+        err instanceof EnvError &&
+        err.message.includes('HUB_API_IDENTITY_CREDENTIAL') &&
+        !err.message.includes(bad),
+      `${bad} was accepted as a credential`,
+    )
+  }
+})
+
+test('a short credential is refused, and the unit is BYTES rather than keystrokes', () => {
+  // HUB_POLICY_TOKEN was the subject here; it is retired, and the credential that replaced all six
+  // takes the shared floor for the same reason.
+  //
+  // THIS ASSERTION USED TO READ `/at least 24 characters/`, AND THAT WORDING WAS THE DEFECT. It
+  // pinned a floor counted in KEYSTROKES — the same floor micro-org #142's 40-character placeholder
+  // cleared on 44 containers — so any fix that started counting bytes would have failed CI however
+  // much better the new rule was. `cfsc_` plus 32 keystrokes of base64url is 24 BYTES, under the
+  // floor and past the old check.
   assert.throws(
-    () => loadEnv({ ...BASE, HUB_API_IDENTITY_CREDENTIAL: 'changeme' }),
-    /HUB_API_IDENTITY_CREDENTIAL is set to a known placeholder/,
+    () => loadEnv({ ...BASE, HUB_API_IDENTITY_CREDENTIAL: 'cfsc_short' }),
+    (err: unknown) =>
+      err instanceof EnvError &&
+      /HUB_API_IDENTITY_CREDENTIAL/.test(err.message) &&
+      /bytes of key material/.test(err.message) &&
+      /at least 32/.test(err.message) &&
+      !err.message.includes('cfsc_short'),
+  )
+  // Without the prefix it is not a credential at all, however long it is.
+  assert.throws(
+    () => loadEnv({ ...BASE, HUB_API_IDENTITY_CREDENTIAL: 'short' }),
+    (err: unknown) => err instanceof EnvError && /cfsc_/.test(err.message),
   )
 })
 
-test('a short credential is refused', () => {
-  // HUB_POLICY_TOKEN was the subject here; it is retired, and the credential that replaced all six
-  // takes the same length floor for the same reason.
+test('A TOKEN PASTED INTO THE CREDENTIAL IS REFUSED BY NAME — micro-org #222', () => {
+  // The single most likely mistake while this rolls out, and the one the six retired variables
+  // make easy: `HUB_LEDGER_TOKEN` and friends held 600-second JWTs, and one of them pasted here
+  // would authenticate for ten minutes and then reproduce the exact defect the credential removed.
+  //
+  // If this ever fails and the fix on offer is a JWT exemption or a weaker assertion, the fix IS
+  // the defect. The error names the variable and never quotes the value.
   assert.throws(
-    () => loadEnv({ ...BASE, HUB_API_IDENTITY_CREDENTIAL: 'short' }),
-    /at least 24 characters/,
+    () => loadEnv({ ...BASE, HUB_API_IDENTITY_CREDENTIAL: JWT }),
+    (err: unknown) => {
+      assert.ok(err instanceof EnvError)
+      assert.match(err.message, /HUB_API_IDENTITY_CREDENTIAL/)
+      assert.match(err.message, /TOKEN, not a credential|micro-org#197/)
+      assert.ok(!err.message.includes(JWT), 'the error quoted the token back')
+      return true
+    },
   )
+})
+
+test('an empty string is an ABSENT credential, not a present one', () => {
+  // `HUB_API_IDENTITY_CREDENTIAL: ${HUB_API_IDENTITY_CREDENTIAL:-}` in the estate compose expands
+  // to empty when the variable is unset, so this is the literal value a real deployment passes.
+  // Reading it as present would construct a provider around nothing; refusing it would turn the
+  // erasure gap into an outage on the estate's highest fan-out surface.
+  assert.equal(loadEnv({ ...BASE, HUB_API_IDENTITY_CREDENTIAL: '' }).identityCredential, null)
+  assert.equal(loadEnv({ ...BASE, HUB_API_IDENTITY_CREDENTIAL: '   ' }).identityCredential, null)
 })
 
 test('an upstream deadline above the page budget is refused at boot', () => {
@@ -143,7 +231,10 @@ test('any of the six retired tokens being set is reported rather than obeyed', (
     'HUB_PRICING_TOKEN',
     'HUB_POLICY_TOKEN',
   ]) {
-    const env = loadEnv({ ...BASE, [name]: 'a-real-looking-token-of-sufficient-length' })
+    // Deliberately a JWT: it is what these six actually held, and the point of the assertion is
+    // that a RETIRED variable confers nothing — not even when its value is well-formed. Nothing
+    // asserts it, because nothing reads it beyond `.length > 0`.
+    const env = loadEnv({ ...BASE, [name]: JWT })
     assert.equal(env.legacyServiceTokenPresent, true, `${name} was not noticed`)
     // And it confers nothing: setting it must not make the service look configured.
     assert.equal(env.identityCredential, null)

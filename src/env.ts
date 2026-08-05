@@ -25,6 +25,7 @@
  */
 
 import { hostname } from 'node:os'
+import { SecretError, assertServiceCredential } from '@cloudsforge/secrets'
 
 /**
  * The service's own name. A constant rather than a variable: it is a property of the repository,
@@ -41,20 +42,25 @@ export class EnvError extends Error {
 }
 
 /**
- * Values that must never be accepted. The list holds the strings that actually appear in this
- * repository's `.env.example` and in compose files, because those are the ones that get copied
- * into a deployment by someone in a hurry.
+ * THE `PLACEHOLDERS` SET THAT USED TO BE HERE IS GONE, AND ITS ABSENCE IS THE FIX.
+ *
+ * It held eight exact strings and was paired with a 24-character floor. Neither could fail for the
+ * value that actually reached 44 containers on both networks: micro-org #142's
+ * `estate-only-outbox-secret-00000000000000` is 40 characters and was on nobody's list. A check
+ * that cannot fail is worse than no check, because the absence of an alarm gets read as the
+ * absence of a problem — and this service is the estate's highest fan-out surface, so the
+ * credential it holds is the one whose compromise reaches six peers at once.
+ *
+ * A deny-list of exact strings is structurally unable to work: the next placeholder somebody
+ * writes is, by definition, not on it. `@cloudsforge/secrets` asserts the SHAPE of a generated
+ * value instead, which is the property a placeholder cannot have. It is imported rather than
+ * copied so that this service cannot drift from the other sixteen.
+ *
+ * `requiredSecret` went with it and is not replaced: this service reads no `OUTBOX_SIGNING_SECRET`
+ * and no other mandatory secret. It owns no database and publishes no events, so it is on neither
+ * side of the estate's event bus — see the `_noDatabase` note in `package.json`. The one secret it
+ * holds is the credential below, and that one is optional.
  */
-const PLACEHOLDERS = new Set([
-  'changeme',
-  'change-me',
-  'placeholder',
-  'secret',
-  'dev-secret',
-  'dev-service-token',
-  'replace-with-a-real-secret',
-  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-])
 
 type Source = Readonly<Record<string, string | undefined>>
 
@@ -64,36 +70,54 @@ function required(source: Source, name: string): string {
   return value
 }
 
-function requiredSecret(source: Source, name: string, minLength = 24): string {
-  const value = required(source, name)
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
+/**
+ * Re-wrap the shared guard's `SecretError` as this service's `EnvError`.
+ *
+ * `loadEnv` documents a single error class for every configuration failure, and the boot path
+ * catches that one class. The message is preserved verbatim — it already names the variable and
+ * the command that fixes it, and it never contains the value.
+ */
+function asEnvError<T>(run: () => T): T {
+  try {
+    return run()
+  } catch (err) {
+    if (err instanceof SecretError) throw new EnvError(err.message)
+    throw err
   }
-  // Length is a proxy for entropy and the only one available here. It is set above the point at
-  // which a human-chosen string is plausible, so a memorable password fails this check too.
-  if (value.length < minLength) {
-    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
-  }
-  return value
 }
 
 /**
- * A secret that may be absent, but must be real if present.
+ * A SERVICE CREDENTIAL that may be absent, but must be real if present.
  *
- * The distinction matters for the identity credential: absent is a deployment that has not been
- * given one yet and is reported by `/readyz`; a short placeholder is a deployment that believes it
- * HAS one, and would fail on its first call to a peer with a 401 that reads as "the peer rejected
- * hub-api" rather than "nobody set this variable".
+ * ── ABSENCE IS A SUPPORTED MODE, AND IT STAYS ONE ──────────────────────────────────────────────
+ *
+ * Absent is a deployment that has not been given one yet; it returns `null` and `/readyz` reports
+ * it as a HARD failure, so the replica never takes traffic. The empty check therefore stays AHEAD
+ * of the assertion, because compose interpolates `${HUB_API_IDENTITY_CREDENTIAL:-}` and an unset
+ * credential arrives as the EMPTY STRING — that is the supported mode, not a malformed one, and it
+ * is the mode CI's `/livez` smoke test boots the image in. Turning it into `exit(1)` would fail
+ * that job rather than this service.
+ *
+ * What is not supported is a value that is present and rubbish: a short placeholder is a deployment
+ * that believes it HAS a credential, and it fails on its first call to a peer with a 401 that reads
+ * as "the peer rejected hub-api" rather than "nobody set this variable".
+ *
+ * ── WHY NOT `assertGeneratedSecret` ────────────────────────────────────────────────────────────
+ *
+ * Because it would refuse every credential this estate has ever minted, and hub-api would exit 1 at
+ * boot on BOTH networks. A credential is `cfsc_` + base64url, which is neither wholly base64 nor
+ * wholly hex — the underscore in its own prefix disqualifies it. Measured live: the testnet
+ * credential also CONTAINS A HYPHEN while the mainnet one does not, so the "no hyphens" instinct
+ * that is correct for a generated HMAC key would have booted mainnet and killed testnet.
+ *
+ * It also refuses a JWT BY NAME, which is the mistake this variable exists to end: the six
+ * `HUB_*_TOKEN` variables it replaced each held a 600-second token read once at boot, and pasting
+ * one of them in here would be the ten-minute cliff wearing the fix's clothes (micro-org #222).
  */
-function optionalSecret(source: Source, name: string, minLength = 24): string | null {
+function optionalCredential(source: Source, name: string): string | null {
   const value = source[name]?.trim()
   if (!value) return null
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
-  }
-  if (value.length < minLength) {
-    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
-  }
+  asEnvError(() => assertServiceCredential(name, value))
   return value
 }
 
@@ -222,9 +246,9 @@ export function loadEnv(source: Source = process.env, hostname = ''): Env {
       pricing: required(source, 'PRICING_URL'),
       policy: required(source, 'POLICY_URL'),
     },
-    // Not `requiredSecret`: see the field comment. The absence is caught by `/readyz`, which is a
+    // Optional by design: see the field comment. The absence is caught by `/readyz`, which is a
     // check that can fail, rather than by a boot CI cannot perform.
-    identityCredential: optionalSecret(source, 'HUB_API_IDENTITY_CREDENTIAL'),
+    identityCredential: optionalCredential(source, 'HUB_API_IDENTITY_CREDENTIAL'),
     legacyServiceTokenPresent: [
       'HUB_LEDGER_TOKEN',
       'HUB_WALLET_TOKEN',

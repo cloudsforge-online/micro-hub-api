@@ -564,9 +564,11 @@ export async function startEstate(): Promise<Estate> {
 /**
  * An `Env` pointing at a running fake estate.
  *
- * The tokens are long enough to pass `requiredSecret` and are meaningless: the fakes do not check
- * them, because what the tests are about is composition and degradation, not the peers' own
- * authorisation — each peer already tests that for itself.
+ * This builds an `Env` DIRECTLY rather than through `loadEnv`, so the credential below never faces
+ * `@cloudsforge/secrets`' `assertServiceCredential`. That is deliberate and it is the seam these
+ * tests are about: composition and degradation, not the peers' own authorisation — each peer
+ * already tests that for itself, and the fakes do not inspect the bearer at all. `env.test.ts` is
+ * where the guard on that variable is exercised.
  */
 export function estateEnv(estate: Estate, overrides: Partial<Env> = {}): Env {
   const url = (name: UpstreamName) => estate.services[name].url
