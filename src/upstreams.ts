@@ -409,7 +409,7 @@ export interface HttpUpstreamOptions {
  * DEPRECATED ones included — and identity will not mint a deprecated scope either.
  * `LiveScope = Exclude<Scope, DeprecatedScope>`, with `DeprecatedScope` computed FROM `SCOPES` by
  * a conditional type over the `deprecated` field rather than hand-listed
- * (`contracts/packages/auth/src/index.ts:507`), so it cannot drift from the registry.
+ * (`contracts/packages/auth/src/index.ts`), so it cannot drift from the registry.
  *
  * It has to be `satisfies` rather than a type annotation, because this object's KEYS are also a
  * type: `UpstreamProviders` below is `Record<keyof typeof UPSTREAM_SCOPES, …>`. Annotating this

@@ -6,7 +6,7 @@
  *     token: () => token        // upstreams.ts, six times, before this change
  *
  * Six strings read once at boot from tokens that expire in 600 seconds
- * (identity/src/tokens.ts:28), which nothing could re-mint because minting required the `admin`
+ * (identity/src/tokens.ts), which nothing could re-mint because minting required the `admin`
  * role. Ten minutes into every deployment all six died at once and every tile on the dashboard
  * went `unavailable` — the widest blast radius of the defect anywhere in the estate, because this
  * is the surface a user actually looks at.
@@ -33,7 +33,7 @@ const ISSUER = 'https://identity.test'
 const IDENTITY = 'http://identity:4000'
 const CREDENTIAL = 'cfsc_a-long-lived-credential-that-does-not-expire'
 
-/** identity/src/tokens.ts:28. Unchanged by this fix, and it must stay unchanged. */
+/** identity/src/tokens.ts. Unchanged by this fix, and it must stay unchanged. */
 const SERVICE_TTL_SECONDS = 600
 
 const T0 = Date.UTC(2026, 7, 3, 12, 0, 0)

@@ -160,7 +160,7 @@ export interface Env {
    *
    * It replaces `HUB_LEDGER_TOKEN`, `HUB_WALLET_TOKEN`, `HUB_BILLING_TOKEN`,
    * `HUB_ACTIVITY_TOKEN`, `HUB_PRICING_TOKEN` and `HUB_POLICY_TOKEN` — six 600-second tokens
-   * (identity/src/tokens.ts:28) read once at boot. Ten minutes into any deployment all six expired
+   * (identity/src/tokens.ts) read once at boot. Ten minutes into any deployment all six expired
    * and every tile on the dashboard went `unavailable`; nothing could re-mint them, because
    * minting requires the `admin` role.
    *
