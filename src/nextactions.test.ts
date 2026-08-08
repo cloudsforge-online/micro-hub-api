@@ -8,6 +8,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { CHAINS, RETIRED_ASSETS } from '@cloudsforge/contracts-chain'
 import { buildNextActions, type NextActionInputs } from './nextactions.ts'
 import { okTile, unavailableTile, type Tile } from './tiles.ts'
 import type {
@@ -158,6 +159,42 @@ test('only a past-due subscription raises a card', () => {
   )
   assert.equal(actions.length, 1)
   assert.equal(actions[0]?.id, 'subscription_past_due:sub1')
+})
+
+test('the past-due card names no asset at all, because this service cannot know which one', () => {
+  // micro-org #227. This card said "Top up Shards to keep access." for as long as SHARD had been
+  // retired — `RETIRED_ASSETS` in contracts/packages/chain/src/index.ts — telling a user whose
+  // renewal had just failed to acquire an asset the estate no longer issues.
+  //
+  // The replacement is not "say EMBER" even though EMBER is what a renewal really settles in
+  // (`settlementAsset` in billing/src/env.ts, pinned by billing/src/env.test.ts). A
+  // `BillingSubscription` carries no asset and no amount, so any denomination on this card is a
+  // constant copied out of another service's environment — right until billing changes it, and
+  // wrong silently afterwards, which is exactly how the Shards string outlived the retirement.
+  //
+  // Asserted against `CHAINS` rather than against the one word that was wrong: a test that only
+  // forbade "Shards" would pass the day somebody typed "EMBER" here instead, and that string would
+  // be a second copy of billing's configuration living in a BFF that owns no state.
+  const { actions } = buildNextActions(
+    inputs({ subscriptions: okTile('billing', [subscription()]) }),
+  )
+  const card = actions.find((a) => a.kind === 'subscription_past_due')
+  assert.ok(card, 'a past-due subscription must raise a card')
+  assert.equal(card.detail, 'Top up your balance to keep access.')
+
+  const copy = `${card.title} ${card.detail} ${card.verb}`.toLowerCase()
+  for (const asset of Object.keys(CHAINS)) {
+    assert.equal(
+      copy.includes(asset.toLowerCase()),
+      false,
+      `the past-due card names ${asset}; it is built from a record that carries no asset`,
+    )
+  }
+  // And the retired one specifically, spelled out so a reader of a failure knows which defect
+  // came back. `RETIRED_ASSETS` is the authority; 'Shards' is only its display spelling.
+  for (const retired of RETIRED_ASSETS) {
+    assert.equal(copy.includes(retired.toLowerCase()), false, `the past-due card names ${retired}`)
+  }
 })
 
 test('a card whose source is down is absent, not broken, and the source is recorded', () => {
