@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/hub-api",
-  "version": "2.5.5",
+  "version": "2.5.6",
   "private": true,
   "description": "The Forge Hub backend-for-frontend. Composes the dashboard from seven upstreams in one authenticated call, degrades per tile, and owns no state of its own.",
   "license": "MIT",
