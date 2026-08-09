@@ -251,9 +251,38 @@ test('cards are ordered critical, warning, info, and stably within each', () => 
   )
 })
 
+/**
+ * An asset code the contract's depth registry provably does not describe — DERIVED from that
+ * registry rather than named, and the derivation is the whole point.
+ *
+ * This test named `DOGE` until 2026-08-09, when micro-contracts 63a0bc4 ("DOGE and ETC are chain
+ * assets") gave DOGE a `confirmations` of 30 and ETC one of 7500. Every consumer resolves that
+ * package as `link:` at HEAD with no version to stage behind, so the depth arrived here the moment
+ * it merged: the case this test constructs stopped being a case, `buildNextActions` correctly
+ * emitted `3/30 confirmations`, and the suite went red on a change this repository does not
+ * contain. Renaming DOGE to whichever asset is unlisted this week re-arms exactly that trap for
+ * the next one — and the estate added TWO assets in a single commit, across seven services, so the
+ * next one is not hypothetical. A code derived from `CHAINS` cannot collide with an asset the
+ * estate adds later.
+ *
+ * The branch under test is not hypothetical either. `DepositCredit.assetCode` is a `string` (see
+ * upstreams.ts) because wallet's payload is not typed against the union, so any deploy where
+ * wallet has been taught an asset ahead of this build's contracts-chain puts a code with no depth
+ * policy through this path in production.
+ */
+const ASSET_WITH_NO_DEPTH_POLICY = ((): string => {
+  let code = 'NO_DEPTH_POLICY'
+  while (Object.hasOwn(CHAINS, code)) code += 'X'
+  return code
+})()
+
 test('a deposit in an asset with no known depth policy still appears, without a fraction', () => {
   const { actions } = buildNextActions(
-    inputs({ deposits: okTile('wallet', [deposit({ assetCode: 'DOGE', confirmations: 3 })]) }),
+    inputs({
+      deposits: okTile('wallet', [
+        deposit({ assetCode: ASSET_WITH_NO_DEPTH_POLICY, confirmations: 3 }),
+      ]),
+    }),
   )
   assert.equal(actions[0]?.detail, '3 confirmations so far')
   assert.equal(actions[0]?.progress, null, '"3/0" is worse than no fraction')
