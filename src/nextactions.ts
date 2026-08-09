@@ -235,6 +235,43 @@ export function buildNextActions(inputs: NextActionInputs): NextActions {
     }
   })
 
+  // ── THE PAST-DUE CARD NAMES NO ASSET, AND THE ABSENCE IS THE WHOLE FIX ───────────────────────
+  //
+  // It read `'Top up Shards to keep access.'` — micro-org #227. SHARD is RETIRED: `RETIRED_ASSETS`
+  // in contracts/packages/chain/src/index.ts freezes it, `IssuableAssetCode` excludes it from the
+  // type at compile time, and `assertIssuable` throws on it at run time. So the card shown to a
+  // user whose renewal had just failed sent them to acquire an asset the estate no longer issues,
+  // in the one moment they are most likely to act on what it says. That is the third retired-asset
+  // string to reach a user surface (micro-org #15 and #182 were the first two).
+  //
+  // WHAT A RENEWAL ACTUALLY CHARGES, read off billing rather than assumed. `renewSubscription` in
+  // billing/src/jobs.ts posts `purchasePostings({ assetCode: deps.assetCode, … })`, and that asset
+  // is `settlementAsset` from billing/src/env.ts, which is **EMBER** and deliberately NOT
+  // configurable — its own comment says the SHARD it replaced "sat outside the estate's central
+  // guarantee (no balance may exist that the chain does not back)". Prices are held in USD
+  // (`priceAsset`), which never reaches a posting. billing/src/env.test.ts pins both.
+  //
+  // AND THIS CARD STILL MAY NOT SAY "EMBER". The card is built from exactly one input, a
+  // `BillingSubscription` (src/upstreams.ts), and that record carries `id`, `productId`, `status`,
+  // `currentPeriodEnd`, `cancelAt`, `scope` and `confersAccess` — no asset, no amount, no price.
+  // Writing "EMBER" here would be this BFF restating a constant that lives in another service's
+  // environment: it would be correct today, silently wrong the day billing's settlement asset
+  // moves, and nothing in either repository would fail — which is precisely how the Shards string
+  // survived the SHARD retirement in the first place. package.json's `_noDatabase` note states the
+  // same rule for data ("a field that exists only here is a bug"); a denomination that exists only
+  // here is the same bug in copy. If the asset is needed on this card, the fix is billing
+  // returning it on `GET /subscriptions`, not a literal in this file.
+  //
+  // SO THE COPY SAYS THE TRUE PART AND STOPS. "Top up" is right regardless of denomination:
+  // `past_due` is written in exactly one place, the `InsufficientFundsError` branch of
+  // `renewSubscription` calling `markPastDue` (billing/src/subscriptions.ts), so the status means
+  // "the charge could not be taken", never a fault. "to keep access" is right too — `past_due`
+  // confers access via `subscriptionConfersAccess` in contracts-money, and the renewal scan keeps
+  // retrying it because `dueForRenewal` selects `past_due` alongside `trialing` and `active`. The
+  // asset and the amount are named by the surface `href` points at, which is billing's own.
+  //
+  // `nextactions.test.ts` holds the absence: it asserts this card's copy contains no key of
+  // `CHAINS`, so re-typing any asset code here — retired or live — fails the build.
   consult(inputs.subscriptions, (subscriptions) => {
     for (const subscription of subscriptions) {
       if (subscription.status !== 'past_due') continue
@@ -244,7 +281,7 @@ export function buildNextActions(inputs: NextActionInputs): NextActions {
         severity: 'warning',
         source: 'billing',
         title: 'A subscription could not be renewed',
-        detail: 'Top up Shards to keep access.',
+        detail: 'Top up your balance to keep access.',
         verb: 'Fix',
         href: `/billing/subscriptions/${subscription.id}`,
         progress: null,
