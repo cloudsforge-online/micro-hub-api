@@ -30,7 +30,7 @@
  * (wallet), each of which is a genuine "needs you" and none of which had a home before.
  */
 
-import { chainSpec, type AssetCode } from '@cloudsforge/contracts-chain'
+import { chainSpec, type AssetCode, type ChainSpec } from '@cloudsforge/contracts-chain'
 import type {
   BillingSubscription,
   DepositCredit,
@@ -110,22 +110,36 @@ const SEVERITY_ORDER: Readonly<Record<Severity, number>> = Object.freeze({
   info: 2,
 })
 
-/**
- * Approximate block time per chain, in seconds, used only for the "~9 min" on a deposit card.
- *
- * Not a contract and deliberately not treated as one: it is a *display* estimate on a card whose
- * authoritative field is the confirmation count beside it. `contracts-chain` publishes the
- * confirmation depth — which is a contract, and is read from there — but not a block time, because
- * nothing that moves money may depend on one. If this map is wrong the estimate is wrong and
- * nothing else is.
- */
-const BLOCK_SECONDS: Readonly<Partial<Record<AssetCode, number>>> = Object.freeze({
-  EMBER: 15,
-  ETH: 12,
-  BTC: 600,
-  SOL: 1,
-  XRP: 4,
-})
+// ── THERE IS NO BLOCK-TIME TABLE IN THIS FILE ANY MORE, AND THE ABSENCE IS THE FIX ─────────────
+//
+// A `BLOCK_SECONDS` map lived here, typed `Readonly<Partial<Record<AssetCode, number>>>`, holding
+// EMBER, ETH, BTC, SOL and XRP — the five assets that existed on the day it was typed. Its own
+// comment defended it as "not a contract", which was true and was not the problem. The problem is
+// the word `Partial`: it is a total record with the compiler switched off, so LTC, DOGE and ETC
+// were added to `AssetCode` and this map said nothing at all.
+//
+// What a missing row did, traced on 2026-08-09 rather than assumed, because "it throws" and "it
+// falls back to Ember" were both plausible and both wrong: the lookup typed `number | undefined`
+// returned `undefined`, `progressFor` mapped that to `etaMinutes: null`, and hub-web's overview
+// renders the "~N min" suffix only when that field is non-null. So no wrong number ever reached a
+// user — the estimate simply stopped existing, silently, for the three newest assets.
+//
+// That made the omission worst exactly where it hurt most. ETC credits at 7,500 confirmations
+// (contracts/packages/chain/src/index.ts — an anti-reorg depth, not a caution), so an ETC deposit
+// takes over a day, and it was the one deposit in the estate with no wait shown against it. The
+// user who most needed telling to come back tomorrow was the one told nothing.
+//
+// The replacement is not a sixth row and not a fourth table. `chainSpec()` now publishes
+// `blockSeconds`, and `CHAINS` there is a TOTAL `Readonly<Record<AssetCode, ChainSpec>>`, so the
+// next asset the estate adds cannot reach this card without a block time — it fails to compile in
+// the package that owns the union instead of going quiet on a screen. Every value there cites the
+// chain's own source, which is more than this file could ever claim for numbers it had typed by
+// hand: the SOL row here said 1 second against an enforced 400ms slot, and XRP said 4 against a
+// measured 3.88.
+//
+// It is still not a contract, and contracts-chain says so louder than this file did:
+// `blockSecondsIsAdvisory` sits beside the field, and `isConfirmed` takes a count of blocks, so
+// there is no elapsed-time argument for a crediting path to pass even by mistake.
 
 export function buildNextActions(inputs: NextActionInputs): NextActions {
   const actions: NextAction[] = []
@@ -142,10 +156,11 @@ export function buildNextActions(inputs: NextActionInputs): NextActions {
   consult(inputs.deposits, (credits) => {
     for (const credit of credits) {
       if (credit.credited) continue
-      const required = requiredConfirmations(credit.assetCode)
+      const spec = specFor(credit.assetCode)
+      const required = spec === null ? null : spec.confirmations
       // A deposit with no known depth policy is still shown — the user cares that it is in flight
       // — but without a fraction, because "41/0" is worse than "41 confirmations".
-      const progress = required === null ? null : progressFor(credit, required)
+      const progress = spec === null ? null : progressFor(credit, spec)
       actions.push({
         id: `deposit_confirming:${credit.id}`,
         kind: 'deposit_confirming',
@@ -298,21 +313,33 @@ export function buildNextActions(inputs: NextActionInputs): NextActions {
   return { actions, missing }
 }
 
-/** The contract depth, or null for an asset code this build does not know. */
-function requiredConfirmations(assetCode: string): number | null {
+/**
+ * The chain's own spec, or null for an asset code this build does not know.
+ *
+ * One lookup where there used to be two — a depth read from the contract and a block time read
+ * from a local table — so the two halves of a deposit card can no longer come from different
+ * generations of the asset union. `DepositCredit.assetCode` is a `string` (src/upstreams.ts)
+ * because wallet's payload is not typed against the union, so an asset wallet has been taught
+ * ahead of this build's contracts-chain still reaches this path in production; the `catch` is that
+ * case and not a swallowed bug.
+ */
+function specFor(assetCode: string): ChainSpec | null {
   try {
-    return chainSpec(assetCode as AssetCode).confirmations
+    return chainSpec(assetCode as AssetCode)
   } catch {
     return null
   }
 }
 
-function progressFor(credit: DepositCredit, required: number): ActionProgress {
-  const seconds = BLOCK_SECONDS[credit.assetCode as AssetCode]
-  const remaining = Math.max(0, required - credit.confirmations)
+function progressFor(credit: DepositCredit, spec: ChainSpec): ActionProgress {
+  const remaining = Math.max(0, spec.confirmations - credit.confirmations)
   return {
     done: credit.confirmations,
-    total: required,
-    etaMinutes: seconds === undefined ? null : Math.ceil((remaining * seconds) / 60),
+    total: spec.confirmations,
+    // `blockSeconds` is null only for an asset with no chain, which cannot produce a deposit —
+    // but the null is honoured rather than coerced, so that case renders no estimate at all
+    // instead of the "0 min" a fallback of zero would print at the top of a card.
+    etaMinutes:
+      spec.blockSeconds === null ? null : Math.ceil((remaining * spec.blockSeconds) / 60),
   }
 }

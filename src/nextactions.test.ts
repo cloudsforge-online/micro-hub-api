@@ -99,6 +99,60 @@ test('an unconfirmed deposit becomes a card with its progress against the contra
   assert.deepEqual(card?.progress, { done: 41, total: 60, etaMinutes: 5 })
 })
 
+test('EVERY ASSET THE ESTATE CREDITS GETS AN ETA — no asset is silently skipped', () => {
+  // The defect this branch fixes, asserted over the registry rather than over the three assets that
+  // happened to be missing. `BLOCK_SECONDS` here was a `Partial<Record<AssetCode, number>>` with
+  // five rows — the five assets that existed when it was typed — so LTC, DOGE and ETC each arrived
+  // in `AssetCode` and got no estimate, with nothing anywhere reporting it. Naming those three in a
+  // test would fix this week and re-arm the trap for the next asset, exactly as the depth test at
+  // the foot of this file already had to learn (micro-contracts 63a0bc4 broke it by giving DOGE a
+  // depth). Driving the loop off `CHAINS` means a sixth, seventh or eighth asset is covered the day
+  // it merges, without anybody remembering this file exists.
+  for (const [assetCode, spec] of Object.entries(CHAINS)) {
+    if (spec.confirmations === 0) continue // SHARD is retired; it cannot produce a deposit.
+    const { actions } = buildNextActions(
+      inputs({ deposits: okTile('wallet', [deposit({ assetCode, confirmations: 0 })]) }),
+    )
+    const progress = actions[0]?.progress
+    assert.equal(progress?.total, spec.confirmations, `${assetCode} lost its depth`)
+    assert.ok(
+      typeof progress?.etaMinutes === 'number' && progress.etaMinutes > 0,
+      `${assetCode} shows a confirmation count with no wait beside it`,
+    )
+  }
+})
+
+test('the asset with the longest wait is the one that used to show no wait at all', () => {
+  // ETC credits at 7,500 confirmations — an anti-reorg depth — so a fresh ETC deposit is over a day
+  // away, and it was one of the three assets absent from the table this branch deleted. The asset
+  // whose estimate mattered most was the asset with no estimate. Asserted as a band rather than an
+  // exact figure: `blockSeconds` for ETC is a measurement and is expected to be re-measured, while
+  // "an ETC deposit takes the better part of two days" is the claim the card has to keep making.
+  const { actions } = buildNextActions(
+    inputs({ deposits: okTile('wallet', [deposit({ assetCode: 'ETC', confirmations: 0 })]) }),
+  )
+  const eta = actions[0]?.progress?.etaMinutes
+  assert.ok(typeof eta === 'number')
+  assert.ok(eta > 24 * 60, `an ETC deposit is a day-long wait; this card says ${eta} minutes`)
+})
+
+test('the block time comes from the chain spec, not from a table in this service', () => {
+  // The point of the change, stated as arithmetic a reader can check by hand: an estimate derived
+  // from a number this file no longer owns. If a future edit reintroduces a local table, this stays
+  // green only for as long as the copy agrees with contracts-chain — which is the failure mode it
+  // is written to catch, so the expectation is COMPUTED from the spec rather than written out.
+  const spec = CHAINS.EMBER
+  assert.notEqual(spec.blockSeconds, null, 'EMBER is an on-chain asset and must publish a block time')
+  const { actions } = buildNextActions(
+    inputs({ deposits: okTile('wallet', [deposit({ confirmations: 41 })]) }),
+  )
+  assert.deepEqual(actions[0]?.progress, {
+    done: 41,
+    total: spec.confirmations,
+    etaMinutes: Math.ceil(((spec.confirmations - 41) * (spec.blockSeconds ?? 0)) / 60),
+  })
+})
+
 test('a credited deposit raises nothing', () => {
   const { actions } = buildNextActions(
     inputs({ deposits: okTile('wallet', [deposit({ credited: true })]) }),
