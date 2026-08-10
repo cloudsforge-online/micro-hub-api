@@ -112,6 +112,45 @@ test('purposes are summed, and available and reserved stay separable', () => {
   assert.equal(view.totalUsd, '8')
 })
 
+test('HOW a holding was priced travels with it, verbatim from pricing', () => {
+  // EMBER has no exchange listing, so pricing answers `administered` for it and `market` for
+  // everything else (`pricing/src/rates.ts`). Both words arrive here and both must leave, because
+  // the screen that prints "$12,480.00" beside EMBER has no other way to know that no venue has
+  // ever quoted it. Asserted as a PAIR: a field hard-wired to either constant would satisfy one of
+  // these two lines and fail the other.
+  const view = composePortfolio(
+    [balance('EMBER', '1000000000000000000'), balance('BTC', '100000000')],
+    [
+      { ...rate('EMBER', '100', '2026-07-30T14:00:00.000Z'), source: 'administered' },
+      rate('BTC', '60000000000', '2026-07-30T14:00:00.000Z'),
+    ],
+  )
+  assert.equal(view.holdings.find((h) => h.assetCode === 'EMBER')?.priceSource, 'administered')
+  assert.equal(view.holdings.find((h) => h.assetCode === 'BTC')?.priceSource, 'market')
+})
+
+test('a holding no quote produced carries no source, so "no note needed" cannot be faked', () => {
+  // Null must mean "nothing here needs qualifying", never "we did not look". SHARD and USD are
+  // fixed by contract, a minted token has no oracle, and an unpriced holding has no figure at all —
+  // if any of them reported a source, a client would qualify a number pricing never touched.
+  const view = composePortfolio(
+    [
+      balance('SHARD', '100'),
+      balance('USD', '1999'),
+      balance('TOKEN:cf:mint:token:1', '5000'),
+      balance('XRP', '1000000'),
+    ],
+    [rate('XRP', null, '2026-07-30T14:00:00.000Z', false)],
+  )
+  for (const asset of ['SHARD', 'USD', 'TOKEN:cf:mint:token:1', 'XRP']) {
+    assert.equal(
+      view.holdings.find((h) => h.assetCode === asset)?.priceSource,
+      null,
+      `${asset} reported a price source without a pricing quote behind it`,
+    )
+  }
+})
+
 test('a zero balance is not a holding', () => {
   const view = composePortfolio([balance('BTC', '0')], [])
   assert.deepEqual(view.holdings, [])

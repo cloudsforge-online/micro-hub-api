@@ -17,6 +17,13 @@
  * amount loses precision in the least significant digits, which is exactly where a reconciliation
  * drift shows up". Values leave here as decimal strings, never as JSON numbers.
  *
+ * **A priced holding carries HOW it was priced.** `priceSource` is pricing's own `source` passed
+ * through untouched, `'market'` or `'administered'`. Pricing's schema says why it must travel:
+ * "the distinction is carried all the way to the client, because a conversion settled against an
+ * administered price was priced by a person, not by a market". This service used to drop it here,
+ * which is how a wallet came to render a five-figure EMBER total with nothing on screen to say
+ * that no exchange has ever quoted EMBER at all.
+ *
  * **An unpriced holding is shown, not hidden.** Pricing lists an unusable asset rather than
  * omitting it, for the same reason: "omitting it makes a client that iterates the board silently
  * forget the asset exists". A holding with no price appears with a null value and a stated reason,
@@ -54,6 +61,23 @@ export interface Holding {
   readonly quotedAt: string | null
   /** Present exactly when `usd` is null. Pricing's own words where it gave them. */
   readonly priceReason: string | null
+  /**
+   * How the price behind `usd` was arrived at — pricing's own `source`, verbatim.
+   *
+   * `'market'` is a median of four independent venues. `'administered'` means an operator typed the
+   * number because the asset has no exchange listing, which today is EMBER and only EMBER
+   * (`pricing/src/rates.ts`, `ADMINISTERED_ASSETS`). Pricing's schema calls the distinction out in
+   * its own words — "the distinction is carried all the way to the client, because a conversion
+   * settled against an administered price was priced by a person, not by a market" — and this field
+   * is the leg of that carriage that was missing: pricing sent `source` on every rate, and this
+   * service discarded it here, so no screen in the estate could tell a reader which of their
+   * figures a market had ever agreed to.
+   *
+   * Null where no quote was involved at all: SHARD and USD are fixed by contract, a `TOKEN:` asset
+   * has no oracle, and an unpriced holding has no figure to qualify. Null therefore means "this
+   * needs no such note", never "we did not check".
+   */
+  readonly priceSource: string | null
 }
 
 /** One bar of the allocation chart. Sorted, direct-labelled, never a pie — §6 rule 6. */
@@ -158,6 +182,7 @@ export function composePortfolio(
       allocationBps: null,
       quotedAt: valued.quotedAt,
       priceReason: valued.reason,
+      priceSource: valued.source,
     })
   }
 
@@ -197,6 +222,8 @@ interface Valued {
   readonly usdScaled: bigint | null
   readonly quotedAt: string | null
   readonly reason: string | null
+  /** Pricing's `source`, and only where a pricing quote actually produced the figure. */
+  readonly source: string | null
 }
 
 /**
@@ -216,32 +243,48 @@ function value(
   rate: PricingRate | undefined,
 ): Valued {
   if (assetCode === 'SHARD') {
-    return { usdScaled: (amount * RATE_SCALE) / SHARDS_PER_USD, quotedAt: null, reason: null }
+    return {
+      usdScaled: (amount * RATE_SCALE) / SHARDS_PER_USD,
+      quotedAt: null,
+      reason: null,
+      source: null,
+    }
   }
   if (assetCode === 'USD') {
     return {
       usdScaled: (amount * RATE_SCALE) / 10n ** BigInt(USD_DECIMALS),
       quotedAt: null,
       reason: null,
+      source: null,
     }
   }
   if (isTokenAsset(assetCode)) {
     // A user-minted token has no oracle and no known decimals in this fan-out. Neither the amount
     // nor the value can be rendered honestly, so both say so. See the gap list in the README.
-    return { usdScaled: null, quotedAt: null, reason: 'no price source for a minted token' }
+    return {
+      usdScaled: null,
+      quotedAt: null,
+      reason: 'no price source for a minted token',
+      source: null,
+    }
   }
   if (!rate || !rate.usable || rate.usdScaled === null) {
     return {
       usdScaled: null,
       quotedAt: rate?.quotedAt ?? null,
       reason: rate?.reason ?? 'no quote available',
+      source: null,
     }
   }
   const perCoin = safeBigInt(rate.usdScaled)
-  if (perCoin === null) return { usdScaled: null, quotedAt: rate.quotedAt, reason: 'malformed quote' }
+  if (perCoin === null) {
+    return { usdScaled: null, quotedAt: rate.quotedAt, reason: 'malformed quote', source: null }
+  }
 
   const decimals = decimalsFor(assetCode)
-  if (decimals === null) return { usdScaled: null, quotedAt: rate.quotedAt, reason: 'unknown decimals' }
+  if (decimals === null) {
+    return { usdScaled: null, quotedAt: rate.quotedAt, reason: 'unknown decimals', source: null }
+  }
 
   // amount is in smallest units; perCoin is USD per *whole* coin at RATE_SCALE. Dividing by the
   // asset's own scale last keeps every significant digit until the final truncation.
@@ -249,6 +292,9 @@ function value(
     usdScaled: (amount * perCoin) / 10n ** BigInt(decimals),
     quotedAt: rate.quotedAt,
     reason: null,
+    // Pricing's own word, passed through rather than re-derived. A second list of which assets are
+    // administered, kept here, is a second list to forget when one is added.
+    source: rate.source,
   }
 }
 
