@@ -25,8 +25,9 @@ import { test, mock } from 'node:test'
 import assert from 'node:assert/strict'
 import { SignJWT, generateKeyPair } from 'jose'
 import { AUDIENCE, Verifier, serviceTokenProbe } from '@cloudsforge/auth'
-import { Metrics } from '@cloudsforge/telemetry'
+import { Metrics, registerHttpMetrics } from '@cloudsforge/telemetry'
 import { UPSTREAM_SCOPES, httpUpstreams } from './upstreams.ts'
+import { registerServiceMetrics } from './server.ts'
 import type { Env } from './env.ts'
 
 const ISSUER = 'https://identity.test'
@@ -117,8 +118,20 @@ async function world(): Promise<World> {
   return self
 }
 
-/** `httpUpstreams`, not a hand-rolled client — the whole point of the file. */
-function upstreamsFor(w: World, credential: string | null) {
+/**
+ * `httpUpstreams`, not a hand-rolled client — the whole point of the file.
+ *
+ * The default registry is the REGISTERED one rather than a bare `new Metrics()`, because
+ * `@cloudsforge/telemetry` 1.0.1 reports a write to a name it does not know instead of discarding
+ * it in silence. A bare registry here made every one of these tests print `metric write dropped`
+ * for `hub_upstream_ms` — noise, but noise standing exactly where ledger's real defect stands, so
+ * the fix is to give the tests the registry production has rather than to quiet the report.
+ */
+function upstreamsFor(
+  w: World,
+  credential: string | null,
+  metrics: Metrics = registerServiceMetrics(registerHttpMetrics(new Metrics())),
+) {
   const at = (name: string) => `http://${name}:4000`
   const env = {
     port: 0,
@@ -144,7 +157,7 @@ function upstreamsFor(w: World, credential: string | null) {
     circuitResetMs: 10_000,
     instanceId: 'test',
   } as unknown as Env
-  return httpUpstreams({ env, metrics: new Metrics(), fetch: w.fetch })
+  return httpUpstreams({ env, metrics, fetch: w.fetch })
 }
 
 /* ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -237,4 +250,61 @@ test('with no credential the service is NOT ready, and every tile fails closed',
 
   await assert.rejects(() => upstreams.pricingRates('req-1'))
   assert.equal(w.peerCalls.length, 0, 'and nothing was sent unauthenticated')
+})
+
+/* ────────────────────────────────────────────────────────────────────────────────────────────────
+ * A CREDENTIAL FAULT HAS TO BE SELECTABLE, OR THE REASON CODE IS A COMMENT.
+ *
+ * `@cloudsforge/http` has carried `token_unavailable` since micro-runtime#3 — the one outcome
+ * describing a call that did not happen, raised when this process could not mint a service token.
+ * hub-api recorded a duration and nothing else, so every one of those was indistinguishable from a
+ * healthy call, and FASTER than one: a request that never leaves the process costs nothing. That
+ * is the misattribution micro-org#351 measured on the testnet estate on 2026-08-10, where a dead
+ * credential was reported to operators for hours as the peer being unreachable.
+ * ──────────────────────────────────────────────────────────────────────────────────────────────── */
+
+test('a credential fault is counted as token_unavailable, per upstream', async (t) => {
+  const w = await world()
+  t.after(() => mock.timers.reset())
+  clockAt(0)
+
+  const metrics = registerServiceMetrics(registerHttpMetrics(new Metrics()))
+  const upstreams = upstreamsFor(w, null, metrics)
+
+  await assert.rejects(() => upstreams.pricingRates('req-1'))
+  assert.equal(w.peerCalls.length, 0, 'the peer was never dialled, so it is not the peer that failed')
+
+  const rendered = metrics.render()
+  // KILLS: dropping `outcome` from `hub_upstream_calls_total`'s spec labels in `server.ts` —
+  // `@cloudsforge/telemetry` then discards the label and the series collapses to
+  // `{service="pricing"}`, which is exactly how ledger's identical counter lost its own. Also
+  // kills removing the `metrics.increment` from `onResult` in `upstreams.ts`.
+  assert.match(
+    rendered,
+    /hub_upstream_calls_total\{service="pricing",outcome="token_unavailable"\} 1/,
+    'an operator must be able to select the credential case and alert on it alone',
+  )
+  // KILLS: removing the `circuit_open`/`token_unavailable` guard around the `observe`. A call that
+  // never left this process must not improve the latency of an estate that is serving nothing.
+  assert.doesNotMatch(
+    rendered,
+    /hub_upstream_ms_count\{service="pricing"\} [1-9]/,
+    'a call that did not happen is not a fast call',
+  )
+})
+
+test('a healthy call is counted too, so the counter has a denominator', async (t) => {
+  const w = await world()
+  t.after(() => mock.timers.reset())
+  clockAt(0)
+
+  const metrics = registerServiceMetrics(registerHttpMetrics(new Metrics()))
+  const upstreams = upstreamsFor(w, CREDENTIAL, metrics)
+  await upstreams.pricingRates('req-1')
+
+  const rendered = metrics.render()
+  // KILLS: counting only failures — a rate needs both halves, and "no token_unavailable in the
+  // last hour" is worth nothing if the series is absent whenever the estate is quiet.
+  assert.match(rendered, /hub_upstream_calls_total\{service="pricing",outcome="ok"\} 1/)
+  assert.match(rendered, /hub_upstream_ms_count\{service="pricing"\} 1/, 'and it is still timed')
 })

@@ -512,8 +512,27 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
       // The per-attempt timing. Recorded here rather than around the call so a retried request
       // shows two observations, which is what makes "slow because we retried" separable from
       // "slow because the peer is slow".
+      //
+      // **THE COUNTER IS NOT A DUPLICATE OF THE HISTOGRAM.** A duration says how long something
+      // took, never whether it worked, so until this counter existed a revoked service credential
+      // and a healthy upstream were the same observation on `hub_upstream_ms` — and the credential
+      // case looked FASTER, because a call that never left the process costs nothing. See
+      // `hub_upstream_calls_total` in `server.ts` for the estate incident that is written from.
+      //
+      // And the two attempts that never reached the peer are kept OUT of the latency histogram.
+      // `circuit_open` reports `durationMs: 0` for a call this process refused itself, and
+      // `token_unavailable` reports what the token supplier spent, not what a peer did. Feeding
+      // either into `hub_upstream_ms` moves the p99 in the direction of "healthy" at exactly the
+      // moment nothing is being served, which is a check that cannot fail. Everything else stays:
+      // a timeout and a transport error both spent real time against a real socket.
       onResult: (event) => {
-        metrics.observe('hub_upstream_ms', event.durationMs, { service: event.upstream })
+        metrics.increment('hub_upstream_calls_total', {
+          service: event.upstream,
+          outcome: event.outcome,
+        })
+        if (event.outcome !== 'circuit_open' && event.outcome !== 'token_unavailable') {
+          metrics.observe('hub_upstream_ms', event.durationMs, { service: event.upstream })
+        }
       },
     })
 
