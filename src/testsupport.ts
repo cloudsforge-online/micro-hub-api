@@ -1,7 +1,7 @@
 /**
- * Local fakes for the seven upstreams.
+ * Local fakes for the eight upstreams.
  *
- * **Real HTTP servers, not stubbed clients.** Every test in this repository boots seven
+ * **Real HTTP servers, not stubbed clients.** Every test in this repository boots eight
  * `node:http` listeners and points the real `HttpClient` at them. Stubbing the `Upstreams`
  * interface would be quicker and would test nothing that matters: the behaviours under test —
  * a deadline expiring, a breaker opening after repeated transport faults, a connection refused
@@ -361,6 +361,64 @@ export const FIXTURES = {
     },
   ],
 
+  /**
+   * Shaped as `ReadableNotification` in notify/src/server.ts: the stored row plus the `title` and
+   * `href` notify derives from the template. The first row is unread and the second is read, so a
+   * test can tell the whole-inbox `unread` count below apart from anything derivable from this
+   * list — the distinction `PAGE.notifications` exists to protect.
+   *
+   * `account.verify_email` is the third deliberately: it is the live template whose `path` IS a
+   * single-use credential, so notify answers `href: null` for it and the tile must carry a row
+   * with no link rather than dropping it.
+   */
+  notifications: [
+    {
+      id: 'n1',
+      userId: USER_ID,
+      category: 'security',
+      priority: 'high',
+      templateId: 'security.new_device',
+      title: 'A new device signed in',
+      href: '/settings/security/sessions',
+      params: { device: 'Firefox on Linux' },
+      locale: 'en-GB',
+      subjectUrn: 'cf:identity:session:s2',
+      createdAt: '2026-07-30T14:10:00.000Z',
+      readAt: null,
+    },
+    {
+      id: 'n2',
+      userId: USER_ID,
+      category: 'money',
+      priority: 'normal',
+      templateId: 'wallet.deposit_credited',
+      title: 'A deposit was credited',
+      href: '/wallet',
+      params: { amount: '0.5', assetCode: 'EMBER' },
+      locale: 'en-GB',
+      subjectUrn: 'cf:chain:ember:mainnet:0xdeadbeef',
+      createdAt: '2026-07-30T13:50:00.000Z',
+      readAt: '2026-07-30T13:52:00.000Z',
+    },
+    {
+      id: 'n3',
+      userId: USER_ID,
+      category: 'account',
+      priority: 'high',
+      templateId: 'account.verify_email',
+      title: 'Confirm your email address',
+      href: null,
+      params: { handle: 'ash', verifyUrl: '[redacted]' },
+      locale: 'en-GB',
+      subjectUrn: null,
+      createdAt: '2026-07-30T12:00:00.000Z',
+      readAt: null,
+    },
+  ],
+
+  /** Unread across the WHOLE inbox — larger than the page, which is the point of the field. */
+  unreadNotifications: 12,
+
   freezes: [
     {
       id: 'f1',
@@ -384,6 +442,7 @@ export type UpstreamName =
   | 'activity'
   | 'pricing'
   | 'policy'
+  | 'notify'
 
 export const UPSTREAM_NAMES: readonly UpstreamName[] = Object.freeze([
   'ledger',
@@ -393,6 +452,7 @@ export const UPSTREAM_NAMES: readonly UpstreamName[] = Object.freeze([
   'activity',
   'pricing',
   'policy',
+  'notify',
 ])
 
 type Handler = (url: URL) => { status: number; body: unknown } | null
@@ -405,6 +465,12 @@ export class FakeService {
   #port = 0
   /** Requests served since construction. Lets a test prove a cache hit made no call. */
   calls = 0
+  /**
+   * The query string of the most recent request. A tile that asks for the wrong page size or the
+   * wrong subject still composes perfectly, so the only way to catch it is to look at what was
+   * actually asked for.
+   */
+  lastQuery: URLSearchParams | null = null
   /** Milliseconds to stall before answering. Used for the deadline test. */
   latencyMs = 0
   /** When set, every request answers this status instead of routing. */
@@ -449,6 +515,7 @@ export class FakeService {
 
   async #respond(req: IncomingMessage, res: ServerResponse): Promise<void> {
     this.calls += 1
+    this.lastQuery = new URL(req.url ?? '/', 'http://fake').searchParams
     if (this.latencyMs > 0) await delay(this.latencyMs)
     if (this.failWith !== null) {
       res.writeHead(this.failWith, { 'content-type': 'application/json' })
@@ -476,7 +543,7 @@ export interface Estate {
   close(): Promise<void>
 }
 
-/** Boot all seven peers. Every route below was read off the peer's own `server.ts`. */
+/** Boot all eight peers. Every route below was read off the peer's own `server.ts`. */
 export async function startEstate(): Promise<Estate> {
   const services: Record<UpstreamName, FakeService> = {
     ledger: new FakeService('ledger', (url) =>
@@ -550,6 +617,22 @@ export async function startEstate(): Promise<Estate> {
         ? { status: 200, body: { freezes: FIXTURES.freezes } }
         : null,
     ),
+    notify: new FakeService('notify', (url) => {
+      if (url.pathname !== '/notifications') return null
+      // `limit` is honoured rather than ignored so a test can prove the dashboard asks for a
+      // preview, and `unread` is served independently of the page — notify counts it across the
+      // whole inbox, and a fake that returned `page.filter(unread).length` would quietly make the
+      // tile's most easily-broken invariant untestable.
+      const limit = Number(url.searchParams.get('limit') ?? '20')
+      return {
+        status: 200,
+        body: {
+          notifications: FIXTURES.notifications.slice(0, limit),
+          nextCursor: null,
+          unread: FIXTURES.unreadNotifications,
+        },
+      }
+    }),
   }
 
   await Promise.all(UPSTREAM_NAMES.map((name) => services[name].start()))
@@ -591,6 +674,7 @@ export function estateEnv(estate: Estate, overrides: Partial<Env> = {}): Env {
       activity: url('activity'),
       pricing: url('pricing'),
       policy: url('policy'),
+      notify: url('notify'),
     },
     identityCredential: token,
     legacyServiceTokenPresent: false,

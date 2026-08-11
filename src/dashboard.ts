@@ -1,5 +1,5 @@
 /**
- * The dashboard composition. One authenticated call, eleven tiles, seven upstreams.
+ * The dashboard composition. One authenticated call, eleven tiles, eight upstreams.
  *
  * ── The property this file exists to have ──────────────────────────────────────────────────────
  *
@@ -26,14 +26,32 @@
  * so a tile that quietly acquires a second dependency fails the build instead of silently
  * widening the blast radius of one peer.
  *
- * ── The tile that is always unavailable ────────────────────────────────────────────────────────
+ * ── THE TILE THAT WAS ALWAYS UNAVAILABLE, AND WHY THAT WAS A DEFECT RATHER THAN A GAP ──────────
  *
- * `notifications` has no upstream configured here. `notify` exists in the estate and serves
- * `GET /notifications?userId=&unread=true` behind the `notify:read` scope, but it is not one of
- * this service's seven, so the tile reports `unavailable` with that fact rather than being omitted
- * or — far worse — synthesised from activity records. Activity is a narrative; a notification is
- * an addressed message with a read state that `notify` owns. Deriving one from the other would put
- * a read state in this service, and a field that exists only here is a bug.
+ * `notifications` used to have no upstream here at all: the tile was a constant, hard-coded
+ * `unavailable` with a reason saying so. The comment that stood in this place called it "the
+ * honest hole" and argued that a stated absence beats a silent one — which is true, and which
+ * missed what the constant was actually doing to the page.
+ *
+ * `degraded` is computed from the tiles, and hub-web turns it into a banner. One permanently
+ * unavailable tile therefore put **"notifications is not showing current data. Everything else on
+ * this page is."** on every signed-in Overview in the estate, for ever, in the voice of an
+ * incident. Measured on 2026-08-11 against both live networks:
+ * `hub_tile_status_total{tile="notifications",status="unavailable"}` was 32 against
+ * `hub_dashboard_ms_count` of 32 on mainnet and 29 against 29 on testnet — a hundred percent of
+ * compositions since boot — while `notify`'s own tables held 172 notifications for 85 users and 77
+ * for 37. The data existed the whole time; nothing here asked for it. A hole a user is shown an
+ * alarm about is not an honest hole, it is a false alarm, and a false alarm that never clears
+ * teaches people to ignore the banner that will one day be real.
+ *
+ * So it is wired. `notify` is the eighth upstream, read at `GET /notifications?userId=&limit=` with
+ * a `notify:read` token, exactly as the old comment said it should be.
+ *
+ * What has NOT changed is the rule underneath it: the tile is still not synthesised from activity
+ * records. Activity is a narrative; a notification is an addressed message with a read state that
+ * `notify` owns. Deriving one from the other would put a read state in this service, and a field
+ * that exists only here is a bug. `unread` is counted by notify across the whole inbox and passed
+ * through untouched.
  */
 
 import type { Logger, Metrics } from '@cloudsforge/telemetry'
@@ -51,11 +69,13 @@ import {
 } from './tiles.ts'
 import {
   CACHE,
+  PAGE,
   type ActivityRecord,
   type BillingEntitlement,
   type BillingSubscription,
   type DepositCredit,
   type IdentityMe,
+  type NotificationRecord,
   type PolicyFreeze,
   type PricingRate,
   type Upstreams,
@@ -85,7 +105,7 @@ export const TILE_SOURCES = Object.freeze({
   restrictions: Object.freeze(['policy']),
   entitlements: Object.freeze(['billing']),
   alerts: Object.freeze(['identity', 'policy']),
-  notifications: Object.freeze([] as readonly string[]),
+  notifications: Object.freeze(['notify']),
 }) satisfies Readonly<Record<string, readonly string[]>>
 
 /** Withdrawal states that are over. Everything else is still the user's business. */
@@ -147,8 +167,14 @@ export interface Entitlements {
 }
 
 export interface Notifications {
+  /**
+   * Unread across the whole inbox, not within `items`. notify counts it in its own query, so a
+   * badge reading "12" above a list of five rows is right rather than inconsistent — see
+   * `PAGE.notifications`.
+   */
   readonly unread: number
-  readonly items: readonly never[]
+  /** The newest few, whatever their read state. A preview, with a link out, like activity. */
+  readonly items: readonly NotificationRecord[]
 }
 
 export interface Dashboard {
@@ -208,14 +234,34 @@ export async function composeDashboard(
   /**
    * Race one tile against the page deadline.
    *
-   * The loser is abandoned rather than cancelled. `loadTile` never rejects, so an abandoned
-   * promise cannot become an unhandled rejection; it settles later, writes its result into the
-   * cache, and thereby makes the *next* request fast. Cancelling it would throw that away.
+   * The WORK is abandoned rather than cancelled when the deadline wins. `loadTile` never rejects,
+   * so an abandoned promise cannot become an unhandled rejection; it settles later, writes its
+   * result into the cache, and thereby makes the *next* request fast. Cancelling it would throw
+   * that away.
+   *
+   * The DEADLINE, by contrast, is given up on the moment the work arrives, and that asymmetry was
+   * a bug for as long as this function has existed. `AbortSignal.timeout` fires whether or not
+   * anybody is still listening, so the losing branch used to run its body a full
+   * `HUB_DASHBOARD_DEADLINE_MS` after the response had already gone out: ten `tile missed the
+   * dashboard deadline` warnings and ten `hub_tile_status_total{status="unavailable"}` increments
+   * per request, for tiles that had answered in milliseconds. It was invisible because the tile
+   * value itself was discarded by the settled race — only the side effects escaped.
+   *
+   * They escaped into the one place that hurt. Measured live on 2026-08-11, EVERY guarded tile on
+   * both networks reported `unavailable` exactly as many times as the dashboard had been composed
+   * (mainnet 32 of 32, testnet 29 of 29) while every one of them was in fact serving `ok` — which
+   * made the counter useless for answering "is this tile really broken", the question it exists to
+   * answer, and which nearly buried the real defect this file was opened for. A metric that is
+   * always at 100% is not a metric.
    */
-  const guard = <T>(tile: string, upstream: string, empty: T, work: Promise<Tile<T>>) =>
-    Promise.race([
-      work,
-      whenAborted(deadline).then(() => {
+  const guard = <T>(tile: string, upstream: string, empty: T, work: Promise<Tile<T>>) => {
+    const expiry = whenAborted(deadline)
+    return Promise.race([
+      work.then((value) => {
+        expiry.giveUp()
+        return value
+      }),
+      expiry.promise.then(() => {
         deps.logger.warn('tile missed the dashboard deadline', {
           tile,
           upstream,
@@ -229,6 +275,7 @@ export async function composeDashboard(
         )
       }),
     ])
+  }
 
   const tileDeps: TileDeps = deps.now
     ? { cache: deps.cache, metrics: deps.metrics, logger: deps.logger, now: deps.now }
@@ -411,22 +458,52 @@ export async function composeDashboard(
     }),
   )
 
-  const [balances, prices, wallets, deposits, withdrawals, activity, security, restrictions, entitlements] =
-    await Promise.all([
-      balancesPromise,
-      pricesPromise,
-      walletsPromise,
-      depositsPromise,
-      withdrawalsPromise,
-      activityPromise,
-      securityPromise,
-      restrictionsPromise,
-      entitlementsPromise,
-    ])
+  const notificationsPromise = guard(
+    'notifications',
+    'notify',
+    { unread: 0, items: [] } as Notifications,
+    loadTile<Notifications>(tileDeps, {
+      tile: 'notifications',
+      upstream: 'notify',
+      key: `notify:inbox:${userId}`,
+      ...CACHE.notifications,
+      empty: { unread: 0, items: [] },
+      // Mapped inside the loader so the cache holds the tile's shape rather than the wire's:
+      // `nextCursor` is a paging handle for a list this tile does not page, and caching it would
+      // invite a later reader to follow a cursor into a page nobody asked for.
+      load: async () => {
+        const page = await deps.upstreams.notifications(userId, PAGE.notifications, requestId)
+        return { unread: page.unread, items: page.notifications }
+      },
+    }),
+  )
+
+  const [
+    balances,
+    prices,
+    wallets,
+    deposits,
+    withdrawals,
+    activity,
+    security,
+    restrictions,
+    entitlements,
+    notifications,
+  ] = await Promise.all([
+    balancesPromise,
+    pricesPromise,
+    walletsPromise,
+    depositsPromise,
+    withdrawalsPromise,
+    activityPromise,
+    securityPromise,
+    restrictionsPromise,
+    entitlementsPromise,
+    notificationsPromise,
+  ])
 
   const portfolio = composePortfolioTile(balances, prices)
   const alerts = composeAlerts(security, restrictions)
-  const notifications = notificationsTile(deps)
 
   const tiles: DashboardTiles = {
     portfolio,
@@ -578,29 +655,39 @@ export function composeAlerts(
   }
 }
 
-/**
- * The honest hole.
- *
- * `notify` owns notifications and their read state, and it is not one of this service's
- * upstreams. Wiring it is `GET /notifications?userId=<id>&unread=true` with a `notify:read` token
- * — roughly ten lines here and one env var — and until that happens the tile says so rather than
- * being quietly dropped from the response. A client that renders an `unavailable` tile shows an
- * empty bell with a tooltip; a client given no tile at all shows nothing and nobody notices the
- * feature is missing.
- */
-function notificationsTile(deps: DashboardDeps): Tile<Notifications> {
-  deps.metrics.increment('hub_tile_status_total', { tile: 'notifications', status: 'unavailable' })
-  return unavailableTile(
-    'notify',
-    { unread: 0, items: [] },
-    'notify is not a configured upstream of hub-api; notifications are not yet composed',
-  )
+/** A deadline one tile is watching, and the ability to stop watching it. */
+interface Expiry {
+  /** Settles when the signal aborts, and never after `giveUp`. Never rejects, so it needs no catch. */
+  readonly promise: Promise<void>
+  /**
+   * Stop watching. The promise is left permanently pending — deliberately, because the only
+   * consumer is a `Promise.race` that has already settled by the time this is called, and a
+   * pending branch of a settled race is inert. Resolving it instead would run the deadline body
+   * for a tile that arrived on time, which is the phantom-metric bug described on `guard`.
+   */
+  giveUp(): void
 }
 
-/** Settles when the signal aborts. Never rejects, so it can be raced without a catch. */
-function whenAborted(signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return Promise.resolve()
-  return new Promise((resolve) => {
-    signal.addEventListener('abort', () => resolve(), { once: true })
+function whenAborted(signal: AbortSignal): Expiry {
+  let fire: (() => void) | null = null
+  const promise = new Promise<void>((resolve) => {
+    fire = resolve
   })
+  const onAbort = () => fire?.()
+  // Deferred rather than resolved on the spot in the already-aborted case: the caller has to be
+  // able to give up before this settles, and a synchronously resolved promise is already out of
+  // reach. (That case needs a fresh `AbortSignal.timeout` to have expired before the first `await`
+  // of the same tick, so it is defensive rather than expected.)
+  if (signal.aborted) queueMicrotask(onAbort)
+  else signal.addEventListener('abort', onAbort, { once: true })
+  return {
+    promise,
+    giveUp() {
+      fire = null
+      // Removed as well as neutered. Ten of these are attached per composition to a signal that
+      // outlives the response by the whole budget; detaching them lets the closures go with the
+      // request rather than with the timer.
+      signal.removeEventListener('abort', onAbort)
+    },
+  }
 }

@@ -11,12 +11,13 @@
  * remember. A connection string here would be the first step towards a table holding a stale copy
  * of a balance the ledger owns.
  *
- * **There are six upstream tokens, not one.** AD-05 gives the reason a BFF exists at all, and one
+ * **There are seven upstream tokens, not one.** AD-05 gives the reason a BFF exists at all, and one
  * of them is that "separating them lets Hub's BFF hold a *scoped* service credential per upstream
  * rather than being trusted with everything". One shared credential is the `PAY_SERVICE_TOKEN`
  * shape the estate is trying to be rid of: it makes a compromise of the most exposed surface in
- * the estate — this one, the fan-out — a compromise of all seven peers at once. Six tokens are six
- * rotations, and that cost is the point.
+ * the estate — this one, the fan-out — a compromise of all eight peers at once. Seven tokens are
+ * seven rotations, and that cost is the point. (Seven, not six, since `notify` became the eighth
+ * upstream — see `UpstreamUrls.notify` for the measurement that made it one.)
  *
  * Identity has no token here, deliberately. `GET /auth/me` and `GET /mfa/factors` are guarded by
  * `authenticateUser`, which refuses a service token outright, so there is no credential this
@@ -145,6 +146,25 @@ export interface UpstreamUrls {
   readonly activity: string
   readonly pricing: string
   readonly policy: string
+  /**
+   * `notify`, the eighth, and REQUIRED like the other seven rather than optional.
+   *
+   * It was absent for the life of this service, and the cost of that absence was not a missing
+   * feature — it was a WRONG PAGE. `dashboard.ts` composed a `notifications` tile that was
+   * hard-coded `unavailable`, so `degraded` contained `notifications` on every response, and
+   * hub-web turns that list into a banner reading "notifications is not showing current data".
+   * Every signed-in Overview in the estate carried it, permanently, on both networks: measured
+   * live on 2026-08-11, `hub_tile_status_total{tile="notifications",status="unavailable"}` was 32
+   * of 32 dashboard compositions on mainnet and 29 of 29 on testnet — 100%, since boot, while
+   * `notify` held 172 and 77 real notifications for 85 and 37 users respectively.
+   *
+   * Required, therefore. Optional would make "nobody configured this" and "notify is having a bad
+   * minute" the same observation, which is exactly the state that lasted this long unnoticed: a
+   * hole nothing could report is a hole nobody fixes. A deployment that has not been given the URL
+   * now fails to start and says which variable is missing, which is a fault an operator can act on
+   * in a minute.
+   */
+  readonly notify: string
 }
 
 export interface Env {
@@ -168,8 +188,8 @@ export interface Env {
    * scopes — this is the highest fan-out surface in the estate, and `wallet:read` and nothing else
    * is the whole point of AD-05. That separation is kept: identity reads the service off the
    * credential ROW and never off the request, so one credential mints everything hub-api is
-   * allowed, and the scope set is a request parameter rather than a second secret. Six providers,
-   * six caches, six narrow tokens, one revocable secret.
+   * allowed, and the scope set is a request parameter rather than a second secret. Seven providers,
+   * seven caches, seven narrow tokens, one revocable secret.
    *
    * Identity is still absent by construction — see the file header. Its two routes refuse a
    * service token, so those calls carry the caller's own bearer.
@@ -245,6 +265,7 @@ export function loadEnv(source: Source = process.env, hostname = ''): Env {
       activity: required(source, 'ACTIVITY_URL'),
       pricing: required(source, 'PRICING_URL'),
       policy: required(source, 'POLICY_URL'),
+      notify: required(source, 'NOTIFY_URL'),
     },
     // Optional by design: see the field comment. The absence is caught by `/readyz`, which is a
     // check that can fail, rather than by a boot CI cannot perform.

@@ -1,7 +1,7 @@
 /**
  * The degradation suite. This is the exit criterion, not a nicety.
  *
- * Seven tests, one per upstream, each killing exactly one peer and asserting three things:
+ * Eight tests, one per upstream, each killing exactly one peer and asserting three things:
  *
  *   1. the response is **200**, never a 500 and never a 503;
  *   2. every tile fed by the dead peer says so, with a reason;
@@ -15,6 +15,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { setTimeout as delay } from 'node:timers/promises'
 import { TILE_SOURCES } from './dashboard.ts'
 import { UPSTREAM_NAMES, get, withHub, type UpstreamName } from './testsupport.ts'
 
@@ -44,13 +45,6 @@ const tilesFedBy = (upstream: UpstreamName): string[] =>
     .filter(([, sources]) => (sources as readonly string[]).includes(upstream))
     .map(([tile]) => tile)
 
-/**
- * `notifications` is excluded from the "everything else is ok" assertion because it is
- * structurally unavailable: `notify` is not one of this service's upstreams. It is asserted
- * explicitly in its own test, so the hole stays visible rather than becoming background noise.
- */
-const ALWAYS_UNAVAILABLE = new Set(['notifications'])
-
 test('with every upstream healthy the dashboard is complete', async () => {
   await withHub({}, async (h) => {
     const res = await get(h, '/v1/dashboard')
@@ -58,11 +52,15 @@ test('with every upstream healthy the dashboard is complete', async () => {
     const body = (await res.json()) as WireDashboard
 
     for (const [name, tile] of Object.entries(body.tiles)) {
-      if (ALWAYS_UNAVAILABLE.has(name)) continue
       assert.equal(tile.status, 'ok', `${name} should be ok but was ${tile.status}: ${tile.reason}`)
       assert.equal(tile.reason, null, `${name} carried a reason while ok`)
     }
-    assert.deepEqual(body.degraded, ['notifications'])
+    // EMPTY, and this is the assertion the owner's bug report was actually about. `degraded` is
+    // what hub-web turns into "<tiles> not showing current data. Everything else on this page is."
+    // — so a permanently degraded tile is a permanent incident banner on every signed-in Overview.
+    // This used to read `['notifications']` and was called a known hole; it was a false alarm
+    // shipped to every user in the estate. See the header of `dashboard.ts`.
+    assert.deepEqual(body.degraded, [])
   })
 })
 
@@ -136,16 +134,69 @@ test('a confirming deposit carries its progress against the contract depth', asy
   })
 })
 
-test('notifications report themselves unavailable rather than being synthesised', async () => {
+/* ------------------------------------------------------- notifications */
+
+/**
+ * The regression test for micro-org #415.
+ *
+ * For as long as this service has existed the `notifications` tile was a constant `unavailable`,
+ * and because `degraded` is derived from the tiles, every signed-in Overview in the estate carried
+ * "notifications is not showing current data. Everything else on this page is." Live on
+ * 2026-08-11, `hub_tile_status_total{tile="notifications",status="unavailable"}` matched
+ * `hub_dashboard_ms_count` exactly on both networks — 100% of compositions — while notify held 172
+ * real notifications for 85 users on mainnet.
+ *
+ * Four assertions, and each of them fails on a different way of half-fixing it:
+ *
+ *   1. the tile is `ok` — the whole report;
+ *   2. it carries the rows notify served, with the WORDS notify wrote, so a client never has to
+ *      know what a template id is;
+ *   3. `unread` is the inbox-wide count and not `items.filter(unread).length` — the fixture makes
+ *      those two differ (12 against 2) precisely so a derived count cannot pass;
+ *   4. a row whose deep link is a single-use credential arrives with `href: null` rather than
+ *      being dropped or, far worse, linked to `/[redacted]`.
+ */
+test('the notifications tile is composed from notify, in notify’s own words', async () => {
   await withHub({}, async (h) => {
     const body = (await (await get(h, '/v1/dashboard')).json()) as WireDashboard
     const tile = body.tiles['notifications']
-    assert.equal(tile?.status, 'unavailable')
-    assert.match(tile?.reason ?? '', /notify is not a configured upstream/)
+
+    assert.equal(tile?.status, 'ok', `notifications was ${tile?.status}: ${tile?.reason}`)
+    assert.equal(tile?.upstream, 'notify')
+    assert.ok(!body.degraded.includes('notifications'), 'a composed tile must not raise the banner')
+
+    const data = tile?.data as {
+      unread: number
+      items: { id: string; title: string; href: string | null; templateId: string }[]
+    }
+    assert.equal(data.unread, 12, 'the badge is the whole inbox, not this page')
+    assert.equal(data.items.length, 3)
+    assert.equal(data.items[0]?.title, 'A new device signed in')
+    assert.equal(data.items[0]?.href, '/settings/security/sessions')
+    for (const item of data.items) {
+      assert.ok(item.title.length > 0, `${item.id} reached the client without a sentence`)
+      assert.ok(!item.title.includes('{{'), `${item.id} carried an unsubstituted placeholder`)
+    }
+
+    // The verification notification, whose path IS the credential notify redacts.
+    const verify = data.items.find((i) => i.templateId === 'account.verify_email')
+    assert.ok(verify, 'a row with no honest link must still be shown')
+    assert.equal(verify.href, null)
+    assert.ok(!JSON.stringify(data).includes('redacted]/'), 'a redacted value became a link')
   })
 })
 
-/* ------------------------------------------------------- the seven degradation tests */
+test('the notifications tile asks for a preview, not the whole inbox', async () => {
+  // Five rows, matching `PAGE.notifications`. The dashboard is a summary with a link out; pulling
+  // a full inbox through it would put notify's paging cost on every page load in the estate.
+  await withHub({}, async (h) => {
+    await get(h, '/v1/dashboard')
+    assert.equal(h.estate.services.notify.lastQuery?.get('limit'), '5')
+    assert.ok(h.estate.services.notify.lastQuery?.get('userId'), 'notify was asked for nobody')
+  })
+})
+
+/* ------------------------------------------------------- the eight degradation tests */
 
 for (const dead of UPSTREAM_NAMES) {
   test(`${dead} down costs its own tiles and nothing else`, async () => {
@@ -178,7 +229,6 @@ for (const dead of UPSTREAM_NAMES) {
 
       let sawUnavailable = false
       for (const [name, tile] of Object.entries(body.tiles)) {
-        if (ALWAYS_UNAVAILABLE.has(name)) continue
         if (affected.includes(name)) {
           assert.notEqual(tile.status, 'ok', `${name} is fed by ${dead} and cannot be ok`)
           assert.ok(tile.reason, `${name} degraded without saying why`)
@@ -257,6 +307,36 @@ test('the page deadline is a backstop when an upstream outlives its own', async 
     const tile = (await res.json() as WireDashboard).tiles['entitlements']
     assert.equal(tile?.status, 'unavailable')
     assert.match(tile?.reason ?? '', /dashboard deadline expired/)
+  })
+})
+
+/**
+ * A tile that answered on time must stay answered after the deadline fires.
+ *
+ * `AbortSignal.timeout` fires whether or not the race it was entered into has already been won, so
+ * the losing branch of every `guard` used to run its body a full budget AFTER the response had
+ * gone out — warning that a tile "missed the dashboard deadline" and counting it `unavailable`.
+ * The tile value was discarded by the settled race, so only the side effects escaped, and they
+ * escaped into the metric an operator uses to answer "is this tile really broken": measured live
+ * on 2026-08-11, every guarded tile on both networks read `unavailable` exactly as many times as
+ * the dashboard had been composed while all of them were serving `ok`.
+ *
+ * Hence the sleep. Asserting immediately after the response passes with the bug present.
+ */
+test('a tile that answered in time is not counted late once the budget elapses', async () => {
+  await withHub({ env: { dashboardDeadlineMs: 200, upstreamDeadlineMs: 150 } }, async (h) => {
+    const body = (await (await get(h, '/v1/dashboard')).json()) as WireDashboard
+    assert.deepEqual(body.degraded, [], 'the fixture estate is healthy')
+
+    await delay(500)
+
+    // The offending lines rather than the whole exposition: a metrics dump is four hundred lines
+    // and the one fact wanted here is which tiles were slandered.
+    const late = h.metrics
+      .render()
+      .split('\n')
+      .filter((line) => line.startsWith('hub_tile_status_total') && line.includes('unavailable'))
+    assert.deepEqual(late, [], 'tiles were counted unavailable after the page had been served')
   })
 })
 

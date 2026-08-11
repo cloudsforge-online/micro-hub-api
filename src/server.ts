@@ -15,7 +15,7 @@
  * session; there is no such thing as a service's dashboard, and accepting a service token here
  * would create a route by which any credential in the estate could read any user's portfolio,
  * wallets, security state and activity in one call. That is a much larger authority than any of
- * the seven upstreams grants individually, and it would exist only because this service composes
+ * the eight upstreams grants individually, and it would exist only because this service composes
  * them. An operator with the `admin` role may name `?userId=`, which is the one supported way to
  * look at somebody else's dashboard — and even then the security tile degrades rather than
  * forwarding the operator's own identity as if it were the subject's.
@@ -274,7 +274,7 @@ function buildRoutes(): Route[] {
       /**
        * Static, deliberately. Liveness answers one question — should this process be killed and
        * restarted — and a liveness probe that consults a dependency restarts a healthy process
-       * every time an upstream blinks. For a service whose entire job is calling seven upstreams,
+       * every time an upstream blinks. For a service whose entire job is calling eight upstreams,
        * that would be a restart loop driven by somebody else's deploy.
        */
       handle: async (_ctx, deps) => ({ status: 200, body: deps.lifecycle.livez() }),

@@ -1,5 +1,5 @@
 /**
- * The seven upstreams, as this service actually calls them.
+ * The eight upstreams, as this service actually calls them.
  *
  * Every type below was read off the peer's `src/server.ts`, not off a shared client library and
  * not off an expectation. Where a route this dashboard obviously wants does not exist, that is
@@ -15,7 +15,7 @@
  *
  * One token per peer, because AD-05 says so and because this service is the highest-fan-out
  * surface in the estate. `HUB_WALLET_TOKEN` carries `wallet:read` and nothing else, so an attacker
- * who reaches this process's environment gets six read credentials rather than one credential that
+ * who reaches this process's environment gets seven read credentials rather than one credential that
  * can move money.
  *
  * ── Identity is the exception, and it is not a shortcut ────────────────────────────────────────
@@ -139,6 +139,20 @@ export const CACHE = Object.freeze({
    * dashboard changes it.
    */
   billingEntitlements: Object.freeze({ ttlMs: 5 * 60_000, staleMs: 30 * 60_000 }),
+
+  /**
+   * Notifications. 10 seconds.
+   *
+   * The same number as the activity feed and for the first half of the same reason — the tile is a
+   * preview of the newest few, and ten seconds of lag on a preview is invisible. The second half is
+   * different and is what stops it being longer: this tile carries an UNREAD COUNT, and a badge is
+   * the one thing on the page a user expects to react to their own action. `POST
+   * /notifications/:id/read` lands on notify, not here, so this cache is the only thing between
+   * marking one read and the badge agreeing — and a count that keeps insisting on the old number
+   * reads as the action having failed, which is the same argument that keeps balances at three
+   * seconds.
+   */
+  notifications: Object.freeze({ ttlMs: 10_000, staleMs: 5 * 60_000 }),
 
   /**
    * Freezes. 30 seconds.
@@ -314,6 +328,46 @@ export interface PricingRate {
   readonly usd: string | null
 }
 
+/**
+ * `notify` — `GET /notifications`. Mirrors `ReadableNotification` in notify/src/server.ts.
+ *
+ * `title` and `href` are DERIVED BY NOTIFY, not stored by it and not composed here. That direction
+ * is the point: `notify/src/templates.ts` is "the only place a user-visible sentence is written",
+ * and a subject rewritten there has to change the words on every row that references it. Building
+ * a sentence in this service, or in the SPA, would be a second copy of the estate's words free to
+ * drift from the first — the same class of defect as a tile deriving a notification from an
+ * activity record, which the header of `dashboard.ts` refused for the same reason.
+ *
+ * `params` is present and is ALREADY REDACTED by the time it is on the wire: notify blanks every
+ * parameter a template declares as a single-use credential at the one point a row becomes a
+ * response. Nothing in this service may put it in a log line regardless — it is arbitrary domain
+ * data, an address or an amount or a device.
+ */
+export interface NotificationRecord {
+  readonly id: string
+  readonly userId: string
+  readonly category: string
+  readonly priority: string
+  readonly templateId: string
+  /** The template's subject, substituted. The sentence a client renders verbatim. */
+  readonly title: string
+  /** A RELATIVE deep link, or null when there is nowhere honest to point. See notify's own note. */
+  readonly href: string | null
+  readonly params: Record<string, unknown>
+  readonly locale: string
+  readonly subjectUrn: string | null
+  readonly createdAt: string
+  readonly readAt: string | null
+}
+
+/** `notify` — the page shape of `GET /notifications`. Mirrors `NotificationPage` in store.ts. */
+export interface NotificationPage {
+  readonly notifications: readonly NotificationRecord[]
+  readonly nextCursor: string | null
+  /** Unread across the WHOLE inbox, not within this page. Counted by notify in its own query. */
+  readonly unread: number
+}
+
 /** `policy` — `GET /subjects/:subject/freezes`. Mirrors `Freeze` in policy/src/freezes.ts. */
 export interface PolicyFreeze {
   readonly id: string
@@ -352,6 +406,7 @@ export interface Upstreams {
   ): Promise<ActivityPage>
   pricingRates(requestId: string): Promise<readonly PricingRate[]>
   policyFreezes(userId: string, requestId: string): Promise<readonly PolicyFreeze[]>
+  notifications(userId: string, limit: number, requestId: string): Promise<NotificationPage>
   /** Breaker state per upstream, for `/readyz` and for the operator who asks "is it us". */
   circuitStates(): Readonly<Record<string, string>>
   /**
@@ -372,6 +427,14 @@ export const PAGE = Object.freeze({
   activity: 25,
   entitlements: 50,
   subscriptions: 20,
+  /**
+   * Notifications. Deliberately the smallest page here, and smaller than the tile's preview needs
+   * to be sound: the unread COUNT does not come out of this list. notify counts unread across the
+   * whole inbox in its own query, so asking for four rows and reporting "12 unread" is not an
+   * inconsistency — it is the difference between a preview and a total, and the alternative
+   * (deriving the count from the page) would silently cap every badge in the estate at this number.
+   */
+  notifications: 5,
 })
 
 export interface HttpUpstreamOptions {
@@ -439,6 +502,12 @@ export const UPSTREAM_SCOPES = Object.freeze({
   activity: Object.freeze(['notify:read'] as const),
   pricing: Object.freeze(['pricing:read'] as const),
   policy: Object.freeze(['policy:decide'] as const),
+  // The same scope the `activity` entry above already demands, so hub-api's derived grant set —
+  // `IDENTITY_SERVICE_TOKEN_GRANTS`, built from this object by micro-deploy's `derive-grants.mjs`
+  // — is unchanged by the arrival of an eighth upstream. What changes is that the credential is now
+  // exchanged for a token that is actually presented to the service that ENFORCES the scope:
+  // notify's `GET /notifications` is gated on `notify:read` (its `READ_SCOPE`).
+  notify: Object.freeze(['notify:read'] as const),
 }) satisfies Record<string, readonly LiveScope[]>
 
 /** The providers, exposed so `/readyz` can report the credential and a test can drive them. */
@@ -447,7 +516,7 @@ export type UpstreamProviders = Readonly<
 >
 
 /**
- * Build the seven clients.
+ * Build the eight clients.
  *
  * `defaultRetries: 1` rather than the package default of 2. A retry costs the tile part of its
  * budget, and the dashboard would rather have six tiles now than seven tiles late — one retry
@@ -461,8 +530,8 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
   /**
    * One provider per peer, all from the SAME credential, each narrowed to that peer's scope.
    *
-   * Six providers rather than one is deliberate: a single whole-allowlist token would be one
-   * string in this process's memory that reads wallets, ledgers, billing and policy at once. Six
+   * Seven providers rather than one is deliberate: a single whole-allowlist token would be one
+   * string in this process's memory that reads wallets, ledgers, billing and policy at once. Seven
    * exchanges every ten minutes against identity is a trivial cost for keeping AD-05's separation.
    */
   const providers: UpstreamProviders = Object.freeze(
@@ -544,6 +613,7 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
   const activity = make('activity', env.upstreams.activity, providers.activity)
   const pricing = make('pricing', env.upstreams.pricing, providers.pricing)
   const policy = make('policy', env.upstreams.policy, providers.policy)
+  const notify = make('notify', env.upstreams.notify, providers.notify)
 
   return {
     async ledgerBalances(userId, requestId) {
@@ -641,6 +711,16 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
       return body.freezes
     },
 
+    async notifications(userId, limit, requestId) {
+      // `?userId=` rather than a bearer: notify reads "whoever its call names" for a service
+      // principal and refuses a user asking for somebody else, which is the same shape wallet,
+      // billing and policy are read with here. `unread=true` is deliberately NOT set — the tile
+      // shows the newest few whatever their read state, and the unread total comes back on the
+      // page regardless, so filtering here would cost the preview its context and buy nothing.
+      const query = new URLSearchParams({ userId, limit: String(limit) })
+      return notify.get<NotificationPage>(`/notifications?${query.toString()}`, { requestId })
+    },
+
     circuitStates() {
       return {
         ledger: ledger.circuitState,
@@ -650,6 +730,7 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
         activity: activity.circuitState,
         pricing: pricing.circuitState,
         policy: policy.circuitState,
+        notify: notify.circuitState,
       }
     },
     tokenProviders: providers,
