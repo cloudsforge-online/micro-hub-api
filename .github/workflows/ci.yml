@@ -83,6 +83,7 @@ jobs:
         ACTIVITY_URL=http://127.0.0.1:4010
         PRICING_URL=http://127.0.0.1:4007
         POLICY_URL=http://127.0.0.1:4011
+        NOTIFY_URL=http://127.0.0.1:4110
     secrets:
       # @cloudsforge/* resolves through link:../runtime and link:../contracts rather than a
       # registry, so the workflow checks out micro-runtime and micro-contracts as siblings. Both are

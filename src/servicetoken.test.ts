@@ -193,7 +193,7 @@ test('a tile still renders ELEVEN MINUTES after boot — the ten-minute cliff', 
   assert.notEqual(w.peerCalls.at(-1)?.token, atBoot, 'and on a genuinely new token')
 })
 
-test('the six peers get six SEPARATE narrow tokens from the one credential', async (t) => {
+test('each peer gets its OWN narrow token from the one credential', async (t) => {
   const w = await world()
   t.after(() => mock.timers.reset())
   clockAt(0)

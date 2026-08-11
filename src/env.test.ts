@@ -50,6 +50,7 @@ const BASE: Record<string, string> = {
   ACTIVITY_URL: 'http://127.0.0.1:4005',
   PRICING_URL: 'http://127.0.0.1:4006',
   POLICY_URL: 'http://127.0.0.1:4007',
+  NOTIFY_URL: 'http://127.0.0.1:4008',
 }
 for (const [key, value] of Object.entries(BASE)) process.env[key] = value
 
@@ -80,18 +81,20 @@ test('a missing variable names itself', () => {
   })
 })
 
-test('there are six upstream SCOPE SETS and no seventh', () => {
-  // This used to assert six token VARIABLES. There is now one credential and six scope sets, which
-  // is the same separation held one layer down: identity reads the service off the credential row,
-  // so the scope set is a request parameter rather than a second secret.
+test('there is one scope set per service-read upstream, and identity is not one of them', () => {
+  // This used to assert six token VARIABLES, and then six scope sets. There is now one credential
+  // and seven scope sets, which is the same separation held one layer down: identity reads the
+  // service off the credential row, so the scope set is a request parameter rather than a second
+  // secret. `notify` is the seventh, added when the notifications tile stopped being a constant.
   //
   // Identity is still absent by construction, because `/auth/me` and `/mfa/factors` refuse a
-  // service token outright. A seventh scope set would be one that cannot be used, and a credential
+  // service token outright. A scope set for it would be one that cannot be used, and a credential
   // nobody can use is one nobody rotates.
   assert.deepEqual(Object.keys(UPSTREAM_SCOPES).sort(), [
     'activity',
     'billing',
     'ledger',
+    'notify',
     'policy',
     'pricing',
     'wallet',

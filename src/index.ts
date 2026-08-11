@@ -121,13 +121,18 @@ lifecycle
   // unavailable and which will not fix itself. An identity OUTAGE returns warn, deliberately: a
   // hard fail there would empty every balancer in the estate over one bad minute in identity.
   //
-  // Any one provider answers for all six: they are built together from the same credential, so
+  // Any one provider answers for all seven: they are built together from the same credential, so
   // either all are present or none is.
   .addProbe(serviceTokenProbe(upstreams.tokenProviders.ledger))
   .addProbe(httpProbe('ledger', `${env.upstreams.ledger.replace(/\/+$/, '')}/livez`, { kind: 'soft' }))
   .addProbe(httpProbe('wallet', `${env.upstreams.wallet.replace(/\/+$/, '')}/livez`, { kind: 'soft' }))
   .addProbe(httpProbe('pricing', `${env.upstreams.pricing.replace(/\/+$/, '')}/livez`, { kind: 'soft' }))
   .addProbe(httpProbe('activity', `${env.upstreams.activity.replace(/\/+$/, '')}/livez`, { kind: 'soft' }))
+  // notify, for the operator rather than for the balancer. The notifications tile spent the whole
+  // life of this service reporting `unavailable` because nothing here was configured to reach
+  // notify at all, and nothing said so anywhere an operator looks. A soft probe puts the answer to
+  // "can this replica see notify" on `/readyz` without ever removing a replica over it.
+  .addProbe(httpProbe('notify', `${env.upstreams.notify.replace(/\/+$/, '')}/livez`, { kind: 'soft' }))
 
 // 6. Routes. Constructed after the Lifecycle so the health handlers report real state, and after
 //    the clients so a route never lazily constructs one on first request.
