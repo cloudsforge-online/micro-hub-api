@@ -106,10 +106,42 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
     })
     .register({
       name: 'hub_upstream_ms',
-      help: 'Time spent in one upstream call attempt',
+      help: 'Time spent in one upstream call attempt that reached the peer',
       kind: 'histogram',
       labels: ['service'],
       buckets: [5, 10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000],
+    })
+    /**
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * **THE ONE SERIES THAT CAN TELL A DEAD CREDENTIAL FROM A DEAD PEER.**
+     *
+     * Until this existed, everything hub-api recorded about an outbound call was a duration
+     * labelled by service. A duration cannot say whether a call failed, let alone how — so a
+     * revoked service credential, a peer refusing us, and a peer that is genuinely down were all
+     * the same three-millisecond observation on `hub_upstream_ms`, and the credential case looked
+     * BETTER than healthy because a call that never left the process is fast.
+     *
+     * `outcome` is `ResultEvent`'s union from `@cloudsforge/http`, and `token_unavailable` is the
+     * member that matters here: it is the one value describing a call that did not happen, raised
+     * when this process could not mint a service token. On the testnet estate on 2026-08-10 that
+     * exact fault was reported to operators for hours as the indexer being unreachable, and the
+     * remedy printed beside it sent them to a healthy service (micro-org#351). A reason code only
+     * ends that if an operator can select on it, and selecting means a label.
+     *
+     * `circuit_open` is here for the same reason and is worth its own alert: it means this process
+     * refused its own call, so it will not appear in the peer's logs at all.
+     *
+     * **The label list is not decoration.** `@cloudsforge/telemetry` drops any label a spec does
+     * not declare — silently until 1.0.1, which is how ledger's identical counter has been writing
+     * `outcome` into nothing since it was written. Adding a member to that union without adding it
+     * here loses it.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    .register({
+      name: 'hub_upstream_calls_total',
+      help: 'Upstream call attempts, by service and by how the attempt ended',
+      kind: 'counter',
+      labels: ['service', 'outcome'],
     })
     .register({
       name: 'hub_cache_hits_total',
