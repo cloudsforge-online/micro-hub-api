@@ -31,7 +31,13 @@
  * silently drops an asset is a wrong total that looks right.
  */
 
-import { RATE_SCALE, SHARDS_PER_USD, chainSpec, formatAmount } from '@cloudsforge/contracts-chain'
+import {
+  RATE_SCALE,
+  SHARDS_PER_USD,
+  chainSpec,
+  formatAmount,
+  isRetiredAsset,
+} from '@cloudsforge/contracts-chain'
 import {
   USD_DECIMALS,
   isChainAsset,
@@ -42,6 +48,15 @@ import type { LedgerBalance, PricingRate } from './upstreams.ts'
 
 /** Past this many assets the allocation chart folds the tail into "Other". §6 rule 6. */
 export const ALLOCATION_ROWS = 8
+
+/**
+ * How many coins get a headline tile of their own, beside "Total held" and "Assets".
+ *
+ * Three, so the tile row is five across and still fits the grid at a phone width. Everything past
+ * it is one scroll away in the holdings table, which is exhaustive; this row is a glance, and a
+ * glance with nine numbers in it is a table with worse alignment.
+ */
+export const HEADLINE_COINS = 3
 
 export interface Holding {
   readonly assetCode: LedgerAssetCode
@@ -80,6 +95,28 @@ export interface Holding {
   readonly priceSource: string | null
 }
 
+/**
+ * One headline coin tile, decided here rather than by whatever renders it.
+ *
+ * ── Why the SERVICE picks these and not the client ─────────────────────────────────────────────
+ *
+ * Which asset codes are real coins, which are minted tokens with no known decimals, and which are
+ * retired and may not be put in front of anybody as a holding — all three are questions
+ * `contracts-chain` and `contracts-money` already answer, and this service already depends on
+ * both. A browser bundle asking them would need its own copy of that vocabulary, shipped on its
+ * own release cadence, and the first asset added or wound down would be right here and wrong
+ * there with nothing failing in between. `lib/portfolio.ts` in hub-web makes the same argument
+ * about `priceSource` and settles it the same way: "pricing already answers the question on every
+ * rate; this asks it."
+ */
+export interface CoinTile {
+  readonly assetCode: LedgerAssetCode
+  /** Smallest units. Decimal string, for the same BigInt reasons as everything else here. */
+  readonly amount: string
+  /** Human form at the asset's own decimals. Never null: a `TOKEN:` asset never becomes a tile. */
+  readonly amountFormatted: string
+}
+
 /** One bar of the allocation chart. Sorted, direct-labelled, never a pie — §6 rule 6. */
 export interface AllocationRow {
   readonly label: string
@@ -101,10 +138,17 @@ export interface PortfolioView {
   /** Every holding, largest first. Zero balances are dropped: an empty account is not a holding. */
   readonly holdings: readonly Holding[]
   readonly allocation: readonly AllocationRow[]
-  /** Shards, the platform's unit of account. Called out because the layout gives it its own tile. */
-  readonly shards: string
-  /** EMBER, likewise. */
-  readonly ember: string
+  /**
+   * The coins to give a tile of their own, in the order to show them. See `headlineCoins`.
+   *
+   * This replaced two fixed fields, `shards` and `ember`. `shards` was a headline tile for a
+   * RETIRED asset (`RETIRED_ASSETS`, `contracts-chain`) on the estate's most-read screen, and it
+   * was reported by the owner twice — once as copy and once as "we should have the real coins
+   * there". The label was never dishonest: it summed the ledger's own SHARD balances and said so.
+   * It was answering a question nobody asked, in a currency nothing new may be denominated in,
+   * in the space where somebody's Bitcoin should have been.
+   */
+  readonly coins: readonly CoinTile[]
 }
 
 export const EMPTY_PORTFOLIO: PortfolioView = Object.freeze({
@@ -114,8 +158,9 @@ export const EMPTY_PORTFOLIO: PortfolioView = Object.freeze({
   pricingComplete: false,
   holdings: Object.freeze([]),
   allocation: Object.freeze([]),
-  shards: '0',
-  ember: '0',
+  // EMBER only, at zero: the empty portfolio still says what this account's home coin is, and a
+  // degraded tile that renders no coin row at all reflows the whole panel on recovery.
+  coins: Object.freeze([emberTile(0n)]),
 })
 
 interface Summed {
@@ -210,8 +255,60 @@ export function composePortfolio(
     pricingComplete: complete,
     holdings: withAllocation,
     allocation: foldAllocation(withAllocation, totalScaled),
-    shards: (byAsset.get('SHARD')?.total ?? 0n).toString(),
-    ember: formatAmount(byAsset.get('EMBER')?.total ?? 0n, chainSpec('EMBER').decimals),
+    coins: headlineCoins(withAllocation, byAsset),
+  }
+}
+
+/**
+ * The coins that get a tile of their own.
+ *
+ * EMBER first and always, even at zero. It is this platform's own chain, every account has one
+ * whether or not anything has landed in it yet, and a tile row whose contents change shape between
+ * a new account and a funded one is a layout that reflows under the reader.
+ *
+ * After it, the holdings the reader actually has, in `holdings` order — which is by USD value,
+ * largest first, already sorted above. Three rules decide what may follow:
+ *
+ *   - **Chain assets only.** A `TOKEN:` asset has no published decimals in this fan-out
+ *     (`decimalsFor` returns null for it), so there is no honest way to place the decimal point in
+ *     a headline figure. Those holdings still appear in the table, which has a column for saying
+ *     so; a tile has nowhere to put the caveat.
+ *   - **USD is not a coin.** It is the unit "Total held" is already denominated in, so a tile for
+ *     it would be the same number twice.
+ *   - **Nothing retired.** `isRetiredAsset` is asked rather than `assetCode !== 'SHARD'` written,
+ *     for the reason `contracts-chain` gives about every one of these lists: the next asset wound
+ *     down is caught here with no edit. The balance itself is NOT hidden — a retired holding is
+ *     still a real ledger row and still appears in the holdings table with its amount and its
+ *     value. What it loses is the promotion.
+ */
+function headlineCoins(
+  holdings: readonly Holding[],
+  byAsset: ReadonlyMap<LedgerAssetCode, Summed>,
+): CoinTile[] {
+  const tiles = [emberTile(byAsset.get('EMBER')?.total ?? 0n)]
+  for (const holding of holdings) {
+    if (tiles.length >= HEADLINE_COINS) break
+    const code = holding.assetCode
+    if (code === 'EMBER') continue
+    if (!isChainAsset(code) || isRetiredAsset(code)) continue
+    tiles.push({
+      assetCode: code,
+      amount: holding.amount,
+      // Non-null by construction: `decimalsFor` answers for every chain asset, so `formatAmount`
+      // above already produced a string for one. The coalesce is the type system's toll, not a
+      // real branch.
+      amountFormatted: holding.amountFormatted ?? formatAmount(BigInt(holding.amount), chainSpec(code).decimals),
+    })
+  }
+  return tiles
+}
+
+/** EMBER's tile, at whatever amount — the one coin that is always present. */
+function emberTile(amount: bigint): CoinTile {
+  return {
+    assetCode: 'EMBER',
+    amount: amount.toString(),
+    amountFormatted: formatAmount(amount, chainSpec('EMBER').decimals),
   }
 }
 

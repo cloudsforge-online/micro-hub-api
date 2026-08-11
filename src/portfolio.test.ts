@@ -5,7 +5,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { ALLOCATION_ROWS, composePortfolio } from './portfolio.ts'
+import { ALLOCATION_ROWS, HEADLINE_COINS, composePortfolio } from './portfolio.ts'
 import type { LedgerBalance, PricingRate } from './upstreams.ts'
 
 const balance = (
@@ -55,7 +55,17 @@ test('Shards are valued from the contract, not from a quote', () => {
   assert.equal(view.totalUsd, '124.8')
   assert.equal(view.pricingComplete, true, 'a fixed rate is not a missing rate')
   assert.equal(view.pricedAt, null, 'a contract constant has no observation time')
-  assert.equal(view.shards, '12480')
+  // Still a holding, still counted, still in the total — a retired asset is not a hidden one.
+  assert.deepEqual(
+    view.holdings.map((holding) => holding.assetCode),
+    ['SHARD'],
+  )
+  // But no tile of its own. Nothing may be newly denominated in SHARD, so promoting it to the
+  // headline row would be offering the reader a currency they cannot be paid in again.
+  assert.deepEqual(
+    view.coins.map((coin) => coin.assetCode),
+    ['EMBER'],
+  )
 })
 
 test('USD is held as cents', () => {
@@ -209,5 +219,51 @@ test('no prices at all still produces a full holdings list', () => {
   assert.equal(view.holdings.length, 2)
   assert.equal(view.totalUsd, '0')
   assert.equal(view.pricingComplete, false)
-  assert.equal(view.ember, '1')
+  assert.deepEqual(view.coins[0], {
+    assetCode: 'EMBER',
+    amount: '1000000000000000000',
+    amountFormatted: '1',
+  })
+})
+
+test('the headline coins are EMBER first, then what is actually held, largest first', () => {
+  const view = composePortfolio(
+    [
+      balance('EMBER', '1000000000000000000'),
+      balance('BTC', '100000000'),
+      balance('LTC', '500000000'),
+      balance('DOGE', '100000000000'),
+    ],
+    [
+      rate('EMBER', '1000000', '2026-07-30T14:00:00.000Z'),
+      rate('BTC', '60000000000', '2026-07-30T14:00:00.000Z'),
+      rate('LTC', '80000000', '2026-07-30T14:00:00.000Z'),
+      rate('DOGE', '200000', '2026-07-30T14:00:00.000Z'),
+    ],
+  )
+  // BTC $600, LTC $4, DOGE $2, EMBER $1 — but EMBER leads regardless of what it is worth, because
+  // it is this platform's own chain and the row must not change shape between accounts.
+  assert.deepEqual(
+    view.coins.map((coin) => coin.assetCode),
+    ['EMBER', 'BTC', 'LTC'],
+  )
+  assert.equal(view.coins.length, HEADLINE_COINS)
+  // Every figure is the asset's own decimals, not a shared guess: BTC has 8, LTC has 8.
+  assert.equal(view.coins[1]?.amountFormatted, '1')
+  assert.equal(view.coins[2]?.amountFormatted, '5')
+})
+
+test('a minted token and USD are held, and neither becomes a coin tile', () => {
+  // A `TOKEN:` asset has no published decimals in this fan-out, so there is no honest way to place
+  // the point in a headline figure; USD is the unit "Total held" is already in.
+  const view = composePortfolio(
+    [balance('TOKEN:ember:0xabc' as never, '5000'), balance('USD', '1999')],
+    [],
+  )
+  assert.deepEqual(
+    view.coins.map((coin) => coin.assetCode),
+    ['EMBER'],
+  )
+  assert.equal(view.coins[0]?.amountFormatted, '0', 'EMBER leads even when nothing is in it')
+  assert.equal(view.holdings.length, 2, 'both are still holdings')
 })
