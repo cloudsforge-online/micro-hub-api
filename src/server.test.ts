@@ -54,6 +54,7 @@ test('livez is static and stays 200 while the service is unready', async () => {
     upstreams: httpUpstreams({ env, metrics }),
     cache: new TtlCache(),
     dashboardDeadlineMs: env.dashboardDeadlineMs,
+    poolApi: env.poolApi,
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
   const { port } = server.address() as AddressInfo
@@ -118,6 +119,29 @@ test('a request id outside the safe charset is replaced rather than echoed', asy
   })
 })
 
+/* ------------------------------------------------------------------ deployment facts */
+
+test('deployment reports the pool as present by default and needs no token', async () => {
+  // Unauthenticated on purpose: the mining bar renders for a signed-out reader, so a reader who
+  // cannot answer this question is a reader shown a control that leads nowhere.
+  await withHub({}, async (h) => {
+    const res = await fetch(`${h.url}/v1/deployment`)
+    assert.equal(res.status, 200)
+    assert.deepEqual(await res.json(), { poolApi: 'present' })
+  })
+})
+
+test('an estate that runs no pool says so, and only that estate does', async () => {
+  // This is the whole point of serving the fact from the API rather than from the web container:
+  // under the combined view a reader on mainnet asks TESTNET's hub-api what testnet deploys, and
+  // must be told `absent` even though the document they loaded came from an estate that has one.
+  await withHub({ env: { poolApi: 'absent' } }, async (h) => {
+    const res = await fetch(`${h.url}/v1/deployment`)
+    assert.equal(res.status, 200)
+    assert.deepEqual(await res.json(), { poolApi: 'absent' })
+  })
+})
+
 /* ------------------------------------------------------------------ authorisation */
 
 test('no token is 401', async () => {
@@ -156,6 +180,7 @@ test('a verifier that cannot reach its JWKS is 503, never 401', async () => {
     upstreams: httpUpstreams({ env, metrics }),
     cache: new TtlCache(),
     dashboardDeadlineMs: env.dashboardDeadlineMs,
+    poolApi: env.poolApi,
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
   lifecycle.markReady()

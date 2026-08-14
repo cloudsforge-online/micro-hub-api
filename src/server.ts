@@ -74,6 +74,12 @@ export interface ServerDeps {
   readonly upstreams: Upstreams
   readonly cache: TtlCache
   readonly dashboardDeadlineMs: number
+  /**
+   * What `GET /v1/deployment` answers about this estate. Passed in rather than read from `env`
+   * here for the reason every other value in this interface is: a test drives both answers without
+   * touching the process environment.
+   */
+  readonly poolApi: 'present' | 'absent'
   /** Injected clock, so cache ages and elapsed times are deterministic under test. */
   readonly now?: () => number
   readonly beforeScrape?: () => Promise<void>
@@ -312,6 +318,33 @@ function buildRoutes(): Route[] {
       },
     },
 
+    {
+      method: 'GET',
+      path: '/v1/deployment',
+      /**
+       * ONE DEPLOY FACT, UNAUTHENTICATED, SO THE OTHER ESTATE'S PAGE CAN ASK IT.
+       *
+       * `{ "poolApi": "present" | "absent" }` — the same field name and the same vocabulary as the
+       * `/deployment.json` hub-web's nginx renders, so ONE parser in that bundle reads both. See
+       * `env.poolApi` for why a BFF answers a question about a container's nginx at all: under the
+       * combined view the page and the estate it is reading are not the same deployment, and a WEB
+       * path cannot be asked across estates because the `-testnet` web hostnames redirect.
+       *
+       * NO BEARER, deliberately. This says whether a service exists, which is already visible to
+       * anyone who resolves the hostname, and it is read by a page that has not signed in yet —
+       * the mining bar renders for signed-out readers. Gating it would make the pool panel's
+       * explanation of its own absence depend on a session, which is the shape of bug this route
+       * exists to remove. It touches no upstream, no database and no user, so there is nothing
+       * here to rate-limit that the gateway does not already.
+       *
+       * It reports the estate this PROCESS belongs to. That is the whole contract: a caller asks
+       * the estate it means to ask, on that estate's `/v1`, and gets that estate's answer.
+       */
+      handle: async (_ctx, deps) => ({
+        status: 200,
+        body: { poolApi: deps.poolApi },
+      }),
+    },
     {
       method: 'GET',
       path: '/v1/dashboard',

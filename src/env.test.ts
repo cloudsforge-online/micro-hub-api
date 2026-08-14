@@ -70,6 +70,21 @@ test('the defaults are the documented ones', () => {
   assert.equal(env.upstreamDeadlineMs, 1_500)
   assert.equal(env.circuitThreshold, 5)
   assert.equal(env.instanceId, 'host-1')
+  assert.equal(env.poolApi, 'present')
+})
+
+test('pool presence is a deploy fact whose only absent value is the word absent', () => {
+  // Deliberately not validated against an allowlist. An estate that has never heard of this
+  // variable must keep behaving exactly as it did, and a deploy that misspells the value must
+  // degrade to the answer that costs a reader nothing rather than refuse to boot a whole BFF.
+  assert.equal(loadEnv({ ...BASE, POOL_API_PRESENCE: 'absent' }).poolApi, 'absent')
+  // Surrounding whitespace is the reader's, not the operator's: a compose file that quotes the
+  // value with a stray space still means what it says.
+  assert.equal(loadEnv({ ...BASE, POOL_API_PRESENCE: ' absent ' }).poolApi, 'absent')
+  assert.equal(loadEnv({ ...BASE, POOL_API_PRESENCE: 'present' }).poolApi, 'present')
+  for (const fumbled of ['', 'ABSENT', 'no', 'false']) {
+    assert.equal(loadEnv({ ...BASE, POOL_API_PRESENCE: fumbled }).poolApi, 'present', fumbled)
+  }
 })
 
 test('a missing variable names itself', () => {

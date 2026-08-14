@@ -683,6 +683,7 @@ export function estateEnv(estate: Estate, overrides: Partial<Env> = {}): Env {
     circuitThreshold: 5,
     circuitResetMs: 10_000,
     instanceId: 'test',
+    poolApi: 'present',
     ...overrides,
   }
 }
@@ -730,6 +731,7 @@ export async function withHub(
     upstreams,
     cache,
     dashboardDeadlineMs: env.dashboardDeadlineMs,
+    poolApi: env.poolApi,
     ...(options.now ? { now: options.now } : {}),
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
