@@ -145,6 +145,7 @@ const server = createServer({
   upstreams,
   cache,
   dashboardDeadlineMs: env.dashboardDeadlineMs,
+  poolApi: env.poolApi,
   // Cache occupancy is sampled at scrape time rather than on a timer. There is no `setInterval` in
   // this repository, and CI greps for one — rule 8.
   beforeScrape: async () => {

@@ -224,6 +224,33 @@ export interface Env {
    * and the pod name under Kubernetes — in both cases the thing an operator would search for.
    */
   readonly instanceId: string
+  /**
+   * **Whether the estate this process belongs to runs a mining pool.** Served by
+   * `GET /v1/deployment`, and the only deploy fact this service reports about itself.
+   *
+   * ── WHY A BFF ANSWERS A QUESTION ABOUT NGINX ──────────────────────────────────────────────
+   *
+   * hub-web has always answered it from `/deployment.json`, a document its own nginx renders from
+   * this same variable. That is the right answer to "does the estate SERVING this page run a
+   * pool" and it stopped being the question. Under the combined view one set of frontends is
+   * served from the mainnet hostnames and re-points its reads at whichever estate the reader is
+   * viewing, so a mainnet-served page viewing testnet asked `pool-testnet` for `/v1/pool` — and
+   * testnet runs no micro-pool, deliberately and permanently, so it got the 502 the presence
+   * mechanism exists to stop rendering. "The pool could not be read", over a working EMBER miner.
+   *
+   * The document cannot answer it across estates: every `-testnet` WEB hostname 302s to its
+   * mainnet sibling, so a cross-estate read of `/deployment.json` reads the reader's own estate
+   * back. `/v1` is the half of those hostnames that still answers from the other estate. So the
+   * fact is served here, by the one service that already shares a hostname with that page.
+   *
+   * ── `present` IS THE ANSWER TO EVERY AMBIGUITY ────────────────────────────────────────────
+   *
+   * Only the exact string `absent` means "no pool here"; unset, empty, misspelt and mixed-case all
+   * mean `present`. That asymmetry is the safety of the whole mechanism and it is hub-web's rule,
+   * kept identical here on purpose: silence must never become a page telling somebody with
+   * hardware pointed at a working pool that the pool does not exist.
+   */
+  readonly poolApi: 'present' | 'absent'
 }
 
 const LEVELS = new Set(['debug', 'info', 'warn', 'error'])
@@ -283,6 +310,10 @@ export function loadEnv(source: Source = process.env, hostname = ''): Env {
     circuitThreshold: integer(source, 'HUB_CIRCUIT_THRESHOLD', 5, 1, 100),
     circuitResetMs: integer(source, 'HUB_CIRCUIT_RESET_MS', 10_000, 100, 300_000),
     instanceId: optional(source, 'INSTANCE_ID', hostname || 'unknown'),
+    // Not `required`, and not validated against a pair of allowed strings: an estate that has
+    // never heard of this variable must keep behaving exactly as it did, and a deploy that
+    // misspells it must degrade to the answer that costs nothing rather than refuse to boot.
+    poolApi: optional(source, 'POOL_API_PRESENCE', 'present') === 'absent' ? 'absent' : 'present',
   }
 }
 
