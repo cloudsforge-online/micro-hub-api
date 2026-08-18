@@ -419,6 +419,64 @@ export const FIXTURES = {
   /** Unread across the WHOLE inbox — larger than the page, which is the point of the field. */
   unreadNotifications: 12,
 
+  /**
+   * Conversions, as `GET /v1/conversions` serves them. The second has `quotedAt: null`, which is a
+   * real state rather than a lazy fixture: entries booked before micro-org#495 carry no quote
+   * timestamp in their metadata, and a surface that assumes one renders "Invalid Date".
+   */
+  conversions: [
+    {
+      id: 'cv1',
+      occurredAt: '2026-07-30T14:18:00.000Z',
+      recordedAt: '2026-07-30T14:18:00.100Z',
+      fromAssetCode: 'BTC',
+      fromAmount: '10000000',
+      fromAmountFormatted: '0.1',
+      toAssetCode: 'EMBER',
+      toAmount: '3000000000000000000000',
+      toAmountFormatted: '3000',
+      rateScale: '1000000',
+      quotedAt: '2026-07-30T14:17:55.000Z',
+    },
+    {
+      id: 'cv2',
+      occurredAt: '2026-07-29T09:00:00.000Z',
+      recordedAt: '2026-07-29T09:00:00.100Z',
+      fromAssetCode: 'SHARD',
+      fromAmount: '2400',
+      fromAmountFormatted: '2400',
+      toAssetCode: 'EMBER',
+      toAmount: '1200000000000000000',
+      toAmountFormatted: '1.2',
+      rateScale: '1000000',
+      quotedAt: null,
+    },
+  ],
+
+  /** Transfers, both directions. The received one has no counterparty user — a platform credit. */
+  transfers: [
+    {
+      id: 'tr1',
+      occurredAt: '2026-07-30T11:00:00.000Z',
+      recordedAt: '2026-07-30T11:00:00.100Z',
+      direction: 'out',
+      assetCode: 'SHARD',
+      amount: '500',
+      amountFormatted: '500',
+      counterpartyUserId: OTHER_USER_ID,
+    },
+    {
+      id: 'tr2',
+      occurredAt: '2026-07-28T08:00:00.000Z',
+      recordedAt: '2026-07-28T08:00:00.100Z',
+      direction: 'in',
+      assetCode: 'EMBER',
+      amount: '1000000000000000000',
+      amountFormatted: '1',
+      counterpartyUserId: null,
+    },
+  ],
+
   freezes: [
     {
       id: 'f1',
@@ -455,7 +513,20 @@ export const UPSTREAM_NAMES: readonly UpstreamName[] = Object.freeze([
   'notify',
 ])
 
-type Handler = (url: URL) => { status: number; body: unknown } | null
+/**
+ * What a fake peer is told about the request. It was the URL alone until micro-org#496, which is
+ * when wallet gained a `GET /v1/conversions` and a `POST /v1/conversions` at the same path: a
+ * handler that cannot see the method serves the list to a conversion attempt and the test passes
+ * while nothing converts. `body` is the raw text, unparsed, so a handler can also assert on a
+ * malformed one.
+ */
+export interface FakeRequest {
+  readonly method: string
+  readonly headers: NodeJS.Dict<string | string[]>
+  readonly body: string
+}
+
+type Handler = (url: URL, req: FakeRequest) => { status: number; body: unknown } | null
 
 /** One fake peer: a listener, a route table, and the controls a test needs to break it. */
 export class FakeService {
@@ -471,6 +542,11 @@ export class FakeService {
    * actually asked for.
    */
   lastQuery: URLSearchParams | null = null
+  /**
+   * The headers of the most recent request. The idempotency key and the forwarded bearer are both
+   * invisible in the response, so this is the only place a test can prove either reached the peer.
+   */
+  lastHeaders: NodeJS.Dict<string | string[]> = {}
   /** Milliseconds to stall before answering. Used for the deadline test. */
   latencyMs = 0
   /** When set, every request answers this status instead of routing. */
@@ -516,6 +592,11 @@ export class FakeService {
   async #respond(req: IncomingMessage, res: ServerResponse): Promise<void> {
     this.calls += 1
     this.lastQuery = new URL(req.url ?? '/', 'http://fake').searchParams
+    this.lastHeaders = req.headers
+    // Drained unconditionally. An unread request body leaves the socket unusable for keep-alive,
+    // and the client reuses connections — so a fake that ignored a POST body would make the NEXT
+    // test's request hang rather than failing this one.
+    const body = await readAll(req)
     if (this.latencyMs > 0) await delay(this.latencyMs)
     if (this.failWith !== null) {
       res.writeHead(this.failWith, { 'content-type': 'application/json' })
@@ -523,7 +604,7 @@ export class FakeService {
       return
     }
     const url = new URL(req.url ?? '/', 'http://fake')
-    const reply = this.#handler(url)
+    const reply = this.#handler(url, { method: req.method ?? 'GET', headers: req.headers, body })
     if (!reply) {
       res.writeHead(404, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ error: { code: 'not_found' } }))
@@ -538,9 +619,116 @@ export class FakeService {
   }
 }
 
+async function readAll(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = []
+  for await (const chunk of req) chunks.push(chunk as Buffer)
+  return Buffer.concat(chunks).toString('utf8')
+}
+
 export interface Estate {
   readonly services: Readonly<Record<UpstreamName, FakeService>>
   close(): Promise<void>
+}
+
+/* ------------------------------------------------------------------ the fake exchange desk */
+
+/**
+ * The desk fixture's rate: one unit in, a thousand out. Deliberately not a real price. These tests
+ * are about whether hub-api forwards what the desk decided, and a fake that recomputed wallet's
+ * pricing would pass while forwarding nothing.
+ */
+export const DESK_RATE = 1_000n
+
+/** More than this in output units and the fixture desk is short. */
+export const DESK_INVENTORY = 10n ** 24n
+
+/** Verbatim from `wallet/src/money.ts`. Typographic apostrophe included: it is user-facing prose. */
+export const HOLD_NOTICE =
+  'This is a quote, not a hold. Nothing is reserved: the rate and the desk’s inventory can both move before you convert, and the conversion is priced again when you make it.'
+
+const CONVERTIBLE = new Set(['SHARD', 'EMBER', 'BTC', 'LTC', 'DOGE'])
+
+function refuse(status: number, code: string, message: string): { status: number; body: unknown } {
+  return { status, body: { error: { code, message, requestId: 'wallet-req' } } }
+}
+
+/**
+ * Keyset paging over a fixture, under the key the peer names its records with. `nextCursor` is
+ * present and null on the last page rather than omitted — wallet passes the ledger's own value
+ * straight through, and that value is null. (Activity omits it. They differ, so the fakes differ.)
+ */
+function keyset<T extends { id: string }>(
+  rows: readonly T[],
+  key: string,
+  url: URL,
+): { status: number; body: unknown } {
+  const limit = Number(url.searchParams.get('limit') ?? '25')
+  const cursor = url.searchParams.get('cursor')
+  const start = cursor ? rows.findIndex((r) => r.id === cursor) + 1 : 0
+  const page = rows.slice(start, start + limit)
+  const more = start + limit < rows.length
+  const last = page[page.length - 1]
+  return { status: 200, body: { [key]: page, nextCursor: more && last ? last.id : null } }
+}
+
+/**
+ * The refusals wallet's `money.ts` can reach, keyed off the intent, in wallet's own order. A fake
+ * that only ever answered 200 would let hub-api map every refusal to a 500 and stay green — which
+ * is the exact defect micro-org#496 exists to prevent, so the fixture has to be able to say no.
+ */
+function deskDecision(
+  body: string,
+  settling: boolean,
+): { status: number; body: unknown } {
+  let intent: { fromAssetCode?: unknown; toAssetCode?: unknown; amount?: unknown }
+  try {
+    intent = JSON.parse(body) as typeof intent
+  } catch {
+    return refuse(400, 'bad_field', 'body must be JSON')
+  }
+  const from = String(intent.fromAssetCode ?? '').toUpperCase()
+  const to = String(intent.toAssetCode ?? '').toUpperCase()
+  if (from === '' || to === '') return refuse(400, 'bad_field', 'fromAssetCode is required')
+  if (from === to) return refuse(422, 'same_asset', `${from} cannot be converted into itself`)
+  if (!CONVERTIBLE.has(from) || !CONVERTIBLE.has(to)) {
+    return refuse(422, 'not_convertible', 'conversions are supported between SHARD and the chain assets only')
+  }
+  // One asset nothing prices, so the 503 a user meets when a feed is down has a fixture.
+  if (from === 'DOGE') {
+    return refuse(503, 'rate_unavailable', 'there is no usable DOGE price right now; the conversion is refused rather than guessed')
+  }
+  let amount: bigint
+  try {
+    amount = BigInt(String(intent.amount ?? ''))
+  } catch {
+    return refuse(422, 'invalid_amount', 'amount must be an integer of smallest units')
+  }
+  if (amount <= 0n) return refuse(422, 'invalid_amount', 'amount must be positive')
+  const out = amount * DESK_RATE
+  if (out < 1n) return refuse(422, 'amount_too_small', `that amount of ${from} converts to less than one unit of ${to}`)
+  // Inventory is checked only when settling. The quote does not consult it on purpose — wallet
+  // declines to turn the quote endpoint into an oracle for the desk's holdings.
+  if (settling && out > DESK_INVENTORY) {
+    return refuse(409, 'desk_inventory_short', `the desk is out of ${to} right now — try a smaller amount, or try again shortly`)
+  }
+  // The receipt's summary carries no `rateScale` and the quote does. That asymmetry is wallet's,
+  // not a slip here: the entry's metadata records the scale, the summary does not repeat it.
+  const summary = {
+    fromAssetCode: from,
+    fromAmount: amount.toString(),
+    fromAmountFormatted: amount.toString(),
+    toAssetCode: to,
+    toAmount: out.toString(),
+    toAmountFormatted: out.toString(),
+    quotedAt: '2026-07-30T14:22:00.000Z',
+  }
+  if (!settling) {
+    return {
+      status: 200,
+      body: { quote: { ...summary, rateScale: '1000000', hold: false, holdNotice: HOLD_NOTICE } },
+    }
+  }
+  return { status: 201, body: { entryId: 'cv-new', replayed: false, summary } }
 }
 
 /** Boot all eight peers. Every route below was read off the peer's own `server.ts`. */
@@ -551,13 +739,32 @@ export async function startEstate(): Promise<Estate> {
         ? { status: 200, body: { subject: `user:${USER_ID}`, balances: FIXTURES.ledgerBalances } }
         : null,
     ),
-    wallet: new FakeService('wallet', (url) => {
+    wallet: new FakeService('wallet', (url, req) => {
       if (url.pathname === '/v1/wallets') return { status: 200, body: { wallets: FIXTURES.wallets, nextCursor: null } }
       if (url.pathname === '/v1/deposits/credits') {
         return { status: 200, body: { credits: FIXTURES.deposits, nextCursor: null } }
       }
       if (url.pathname === '/v1/withdrawals') {
         return { status: 200, body: { withdrawals: FIXTURES.withdrawals, nextCursor: null } }
+      }
+      // The desk. Method matters from here down: `/v1/conversions` is a list on GET and a
+      // conversion on POST, and they are different routes with different auth in wallet too.
+      if (url.pathname === '/v1/conversions/quote') {
+        return req.method === 'POST' ? deskDecision(req.body, false) : null
+      }
+      if (url.pathname === '/v1/conversions') {
+        if (req.method === 'POST') return deskDecision(req.body, true)
+        return keyset(FIXTURES.conversions, 'conversions', url)
+      }
+      if (url.pathname === '/v1/transfers' && req.method === 'GET') {
+        return keyset(FIXTURES.transfers, 'transfers', url)
+      }
+      const detail = /^\/v1\/conversions\/([^/]+)$/.exec(url.pathname)
+      if (detail && req.method === 'GET') {
+        const found = FIXTURES.conversions.find((c) => c.id === detail[1])
+        return found
+          ? { status: 200, body: { conversion: found } }
+          : refuse(404, 'conversion_not_found', 'no such conversion')
       }
       return null
     }),
@@ -750,4 +957,27 @@ export async function withHub(
 export async function get(h: Harness, path: string, token?: string): Promise<Response> {
   const bearer = token ?? (await signUser())
   return fetch(`${h.url}${path}`, { headers: { authorization: `Bearer ${bearer}` } })
+}
+
+/**
+ * `POST` against the harness. `body` is sent as given — a test can pass a string to send something
+ * that is not JSON, which is the only way to exercise the parse failure.
+ */
+export async function post(
+  h: Harness,
+  path: string,
+  body: unknown,
+  options: { token?: string; idempotencyKey?: string | null } = {},
+): Promise<Response> {
+  const bearer = options.token ?? (await signUser())
+  const key = options.idempotencyKey === undefined ? 'test-key-0001' : options.idempotencyKey
+  return fetch(`${h.url}${path}`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${bearer}`,
+      'content-type': 'application/json',
+      ...(key === null ? {} : { 'idempotency-key': key }),
+    },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  })
 }
