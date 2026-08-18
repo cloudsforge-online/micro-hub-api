@@ -96,6 +96,19 @@ export const CACHE = Object.freeze({
   walletWithdrawals: Object.freeze({ ttlMs: 5_000, staleMs: 60_000 }),
 
   /**
+   * Conversions and transfers. 3 seconds — the balances number, not the withdrawals one.
+   *
+   * A conversion is INSTANT: the entry is written inside the same transaction that moves both
+   * balances, so unlike a withdrawal there is no "settling" state for a user to wait through. The
+   * moment after they press Convert they are looking for their own conversion in this list, and a
+   * five-second cache would put a hole where it should be — read by that user as the conversion
+   * not having happened, on the one screen where that reading is most expensive. Matched to
+   * `ledgerBalances` deliberately: those two are rendered side by side and a user who sees the new
+   * balance but not the record it came from has been shown two versions of one fact.
+   */
+  walletConversions: Object.freeze({ ttlMs: 3_000, staleMs: 60_000 }),
+
+  /**
    * The wallet registry. 60 seconds.
    *
    * Every field in it — label, primary flag, lifecycle state, origin — changes only by an
@@ -241,6 +254,107 @@ export interface WithdrawalRecord {
   readonly failureReason: string | null
   readonly requestedAt: string
   readonly updatedAt: string
+}
+
+/* ---------------------------------------------------------- the exchange desk (micro-org#495) */
+
+/**
+ * `wallet` — one conversion, out of `GET /v1/conversions`. Mirrors `ConversionView`, money.ts.
+ *
+ * `id` is the id of the JOURNAL ENTRY that is the conversion. wallet keeps no conversions table —
+ * "the entry IS the conversion, and a wallet-side copy would be a second record of one fact" — so
+ * this id is what `GET /v1/conversions/:id` takes and what an activity row's `subjectUrn` names.
+ *
+ * Every amount is smallest units as a decimal string, with the human form beside it. Never a JSON
+ * number: these are 78-bit quantities and `JSON.parse` would silently round one.
+ */
+export interface ConversionRecord {
+  readonly id: string
+  readonly occurredAt: string
+  readonly recordedAt: string
+  readonly fromAssetCode: string
+  readonly fromAmount: string
+  readonly fromAmountFormatted: string
+  readonly toAssetCode: string
+  readonly toAmount: string
+  readonly toAmountFormatted: string
+  readonly rateScale: string
+  /** When the price behind the conversion was observed. Null for an entry booked before #495. */
+  readonly quotedAt: string | null
+}
+
+export interface ConversionPage {
+  readonly conversions: readonly ConversionRecord[]
+  readonly nextCursor: string | null
+}
+
+/**
+ * `wallet` — one transfer, out of `GET /v1/transfers`. Mirrors `TransferView`, money.ts.
+ *
+ * Both directions are in one list because the ledger's subject filter returns an entry that touches
+ * this user's account whichever side of it they were on. `counterpartyUserId` is null when the other
+ * leg is not a user account.
+ */
+export interface TransferRecord {
+  readonly id: string
+  readonly occurredAt: string
+  readonly recordedAt: string
+  readonly direction: 'out' | 'in'
+  readonly assetCode: string
+  readonly amount: string
+  readonly amountFormatted: string
+  readonly counterpartyUserId: string | null
+}
+
+export interface TransferPage {
+  readonly transfers: readonly TransferRecord[]
+  readonly nextCursor: string | null
+}
+
+/**
+ * `wallet` — `POST /v1/conversions/quote`. Mirrors `ConversionQuote`, money.ts.
+ *
+ * **`hold` and `holdNotice` are forwarded, never dropped and never summarised.** They are fields
+ * rather than a paragraph in wallet's API docs for one reason, stated there: nothing is reserved by
+ * asking, the rate and the desk's inventory can both move before the conversion, and "a surface that
+ * renders a quote as though it were a hold is making a promise this service has not made". A BFF
+ * that ate the sentence on the way past would put that promise back.
+ */
+export interface ConversionQuote {
+  readonly fromAssetCode: string
+  readonly fromAmount: string
+  readonly fromAmountFormatted: string
+  readonly toAssetCode: string
+  readonly toAmount: string
+  readonly toAmountFormatted: string
+  readonly rateScale: string
+  readonly quotedAt: string
+  readonly hold: false
+  readonly holdNotice: string
+}
+
+/** `wallet` — what a booked conversion answers with. Mirrors `MoneyResult`, money.ts. */
+export interface ConversionReceipt {
+  readonly entryId: string
+  /** True when this key had already been used: the same conversion, not a second one. */
+  readonly replayed: boolean
+  readonly summary: {
+    readonly fromAssetCode: string
+    readonly fromAmount: string
+    readonly fromAmountFormatted: string
+    readonly toAssetCode: string
+    readonly toAmount: string
+    readonly toAmountFormatted: string
+    readonly quotedAt: string
+  }
+}
+
+/** What a caller asks the desk for. The same body both money routes take. */
+export interface ConversionIntent {
+  readonly fromAssetCode: string
+  readonly toAssetCode: string
+  /** Smallest units, decimal string. */
+  readonly amount: string
 }
 
 /** `identity` — `GET /auth/me`. */
@@ -393,6 +507,56 @@ export interface Upstreams {
   walletRegistry(userId: string, requestId: string): Promise<readonly WalletRecord[]>
   walletDeposits(userId: string, requestId: string): Promise<readonly DepositCredit[]>
   walletWithdrawals(userId: string, requestId: string): Promise<readonly WithdrawalRecord[]>
+  walletConversions(
+    userId: string,
+    limit: number,
+    cursor: string | null,
+    requestId: string,
+  ): Promise<ConversionPage>
+  /** One conversion. Rejects with wallet's own 404 when it is not this user's. */
+  walletConversion(userId: string, entryId: string, requestId: string): Promise<ConversionRecord>
+  walletTransfers(
+    userId: string,
+    limit: number,
+    cursor: string | null,
+    requestId: string,
+  ): Promise<TransferPage>
+  /**
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * THE TWO DESK ROUTES TAKE THE CALLER'S BEARER, AND THAT IS NOT THE IDENTITY EXCEPTION AGAIN.
+   *
+   * Identity above is called this way because it REFUSES a service token. wallet does not: it would
+   * accept one happily, and `authenticate` there applies `requireScope` only to a service principal.
+   * The reason these two forward the user's own token is the credential this process holds.
+   *
+   * `UPSTREAM_SCOPES.wallet` is `['wallet:read']`, and the paragraph above it is explicit about why:
+   * "an attacker who reaches this process's memory should find six narrow read tokens, not one that
+   * can move money". Quoting and converting need `wallet:money`. Widening the entry would hand every
+   * route in this file — and anything that later reaches this process — the authority to convert any
+   * user's balances, in order to serve one page, and `derive-grants.mjs` would propagate that
+   * widening into `IDENTITY_SERVICE_TOKEN_GRANTS` estate-wide.
+   *
+   * Forwarding the caller's bearer costs nothing and keeps the authority exactly where it already
+   * was: wallet issued nothing, identity did, the token authorises one user, and wallet checks it
+   * itself. This service gains no ability to move money that the browser did not already have.
+   *
+   * The consequence, which the routes enforce rather than paper over: an operator viewing somebody
+   * else's dashboard with `?userId=` has no forwardable bearer, so they cannot convert on that
+   * person's behalf. That is the correct answer — see `resolveSubject` — and it is a refusal with a
+   * sentence, not a 500.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  quoteConversion(
+    bearer: string,
+    intent: ConversionIntent,
+    requestId: string,
+  ): Promise<ConversionQuote>
+  convert(
+    bearer: string,
+    intent: ConversionIntent,
+    idempotencyKey: string,
+    requestId: string,
+  ): Promise<ConversionReceipt>
   /** Takes the caller's bearer, not a service token. See the file header. */
   identityMe(bearer: string, requestId: string): Promise<IdentityMe>
   identityFactors(bearer: string, requestId: string): Promise<IdentityFactors>
@@ -425,6 +589,14 @@ export const PAGE = Object.freeze({
   deposits: 25,
   withdrawals: 25,
   activity: 25,
+  /**
+   * Conversions and transfers. 25, matching the activity feed rather than the wallet lists.
+   *
+   * These are cursor-paged reads a client walks, not a fixed preview: wallet defaults to 50 and caps
+   * at 200, and asking for its default would make the first page of the Convert history twice as
+   * large as the page after it for no reason a reader can see.
+   */
+  conversions: 25,
   entitlements: 50,
   subscriptions: 20,
   /**
@@ -607,6 +779,26 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
 
   const ledger = make('ledger', env.upstreams.ledger, providers.ledger)
   const wallet = make('wallet', env.upstreams.wallet, providers.wallet)
+  /*
+   * A SECOND CLIENT AT THE SAME BASE URL, with no token provider, for the two desk routes.
+   *
+   * The obvious alternative is to pass `authorization` per request on `wallet` above, and
+   * `HttpClient`'s header precedence would honour it — a per-request header beats the client's
+   * token. What it would NOT escape is `authorizedFetch`: that wrapper catches a 401 from the peer,
+   * re-mints the SERVICE token and replays the call with it. A user's bearer that wallet rejected
+   * would therefore be silently retried as hub-api's own credential, which is micro-org#251 exactly
+   * — settlement forwarded an operator's bearer to custody's admin mint, the client replaced it, and
+   * the route could only ever return 500. Here the replacement would go the other way and succeed:
+   * a service token retrying a refused user conversion.
+   *
+   * A separate client also gets its own breaker, which is what we want in both directions. wallet's
+   * `rate_unavailable` is a 503, and 503 is retriable, so a pricing outage counts against the
+   * breaker — on this client, where it costs the Convert form, and not on the read client, where it
+   * would cost every wallet tile on the dashboard. Conversely a 4xx never trips either: `HttpClient`
+   * calls `succeeded()` on a non-retriable peer decision, so a run of `desk_inventory_short`
+   * refusals — which is the expected steady state of an under-funded desk — leaves this closed.
+   */
+  const walletMoney = make('wallet-money', env.upstreams.wallet)
   // No token: every call carries the caller's own, per request. See the file header.
   const identity = make('identity', env.upstreams.identity)
   const billing = make('billing', env.upstreams.billing, providers.billing)
@@ -649,6 +841,49 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
         { requestId },
       )
       return body.withdrawals
+    },
+
+    async walletConversions(userId, limit, cursor, requestId) {
+      const query = new URLSearchParams({ userId, limit: String(limit) })
+      if (cursor) query.set('cursor', cursor)
+      return wallet.get<ConversionPage>(`/v1/conversions?${query.toString()}`, { requestId })
+    },
+
+    async walletConversion(userId, entryId, requestId) {
+      const query = new URLSearchParams({ userId })
+      const body = await wallet.get<{ conversion: ConversionRecord }>(
+        `/v1/conversions/${encodeURIComponent(entryId)}?${query.toString()}`,
+        { requestId },
+      )
+      return body.conversion
+    },
+
+    async walletTransfers(userId, limit, cursor, requestId) {
+      const query = new URLSearchParams({ userId, limit: String(limit) })
+      if (cursor) query.set('cursor', cursor)
+      return wallet.get<TransferPage>(`/v1/transfers?${query.toString()}`, { requestId })
+    },
+
+    async quoteConversion(bearer, intent, requestId) {
+      const body = await walletMoney.post<{ quote: ConversionQuote }>(
+        '/v1/conversions/quote',
+        intent,
+        { headers: { authorization: `Bearer ${bearer}` }, requestId },
+      )
+      return body.quote
+    },
+
+    async convert(bearer, intent, idempotencyKey, requestId) {
+      // The key is the CALLER's, forwarded verbatim rather than minted here. One intent is one key
+      // for its whole life — the browser mints it when the reader reviews, and a retry of the same
+      // press must reach wallet carrying the same string or the replay stops being a replay. A key
+      // generated in this process would be a new one per proxy hop, which is the one thing an
+      // idempotency key must never be.
+      return walletMoney.post<ConversionReceipt>('/v1/conversions', intent, {
+        headers: { authorization: `Bearer ${bearer}` },
+        idempotencyKey,
+        requestId,
+      })
     },
 
     async identityMe(bearer, requestId) {
@@ -725,6 +960,10 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
       return {
         ledger: ledger.circuitState,
         wallet: wallet.circuitState,
+        // Reported separately because it fails separately. An operator reading `/readyz` during a
+        // pricing outage should see this one open and `wallet` closed, which is the whole reason
+        // there are two clients.
+        'wallet-money': walletMoney.circuitState,
         identity: identity.circuitState,
         billing: billing.circuitState,
         activity: activity.circuitState,

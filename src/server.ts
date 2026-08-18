@@ -40,6 +40,7 @@ import {
   statusFor,
   type Principal,
 } from '@cloudsforge/auth'
+import { HttpError } from '@cloudsforge/http'
 import type { Lifecycle } from '@cloudsforge/lifecycle'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import type { TtlCache } from './cache.ts'
@@ -53,10 +54,13 @@ import {
   PAGE,
   type ActivityPage,
   type ActivityRecord,
+  type ConversionIntent,
+  type ConversionPage,
   type DepositCredit,
   type LedgerBalance,
   type PolicyFreeze,
   type PricingRate,
+  type TransferPage,
   type Upstreams,
   type WithdrawalRecord,
 } from './upstreams.ts'
@@ -179,13 +183,58 @@ interface RequestContext {
   readonly url: URL
   readonly requestId: string
   readonly log: Logger
+  /** Segments captured by a `:name` in the matched route's path. Empty for a literal route. */
+  readonly params: Readonly<Record<string, string>>
 }
 
 interface Route {
   readonly method: string
+  /** A literal path, or one with `:name` segments — see `matchPath`. */
   readonly path: string
   readonly handle: (ctx: RequestContext, deps: ServerDeps) => Promise<Reply>
 }
+
+/**
+ * Match one route pattern against a path, capturing `:name` segments.
+ *
+ * Every route in this service was a literal string until `GET /v1/conversions/:id` arrived, and the
+ * router was `r.path === url.pathname`. This is the smallest thing that serves that route without
+ * becoming a framework: segment count must agree, a `:name` segment captures, and everything else
+ * must be equal. There is no wildcard, no optional segment and no regular expression, because none
+ * of those has a caller.
+ *
+ * **The captured value is decoded here and nowhere else.** `url.pathname` is still percent-encoded,
+ * and an id that reached an upstream still encoded would be a different id than the one asked for —
+ * silently, and only for the ids that happen to contain an encodable character.
+ */
+function matchPath(pattern: string, pathname: string): Readonly<Record<string, string>> | null {
+  if (!pattern.includes(':')) return pattern === pathname ? EMPTY_PARAMS : null
+  const want = pattern.split('/')
+  const got = pathname.split('/')
+  if (want.length !== got.length) return null
+  const params: Record<string, string> = {}
+  for (let i = 0; i < want.length; i++) {
+    const segment = want[i] as string
+    const value = got[i] as string
+    if (segment.startsWith(':')) {
+      // An empty segment is not a match. `/v1/conversions/` would otherwise capture '' and be
+      // proxied as a request for the conversion whose id is the empty string.
+      if (value.length === 0) return null
+      try {
+        params[segment.slice(1)] = decodeURIComponent(value)
+      } catch {
+        // A malformed escape is not a route match; it is a path this service does not serve, and
+        // answering 404 is truer than answering 400 about a segment nothing would have accepted.
+        return null
+      }
+      continue
+    }
+    if (segment !== value) return null
+  }
+  return params
+}
+
+const EMPTY_PARAMS: Readonly<Record<string, string>> = Object.freeze({})
 
 export function createServer(deps: ServerDeps): Server {
   const routes = buildRoutes()
@@ -200,9 +249,21 @@ export function createServer(deps: ServerDeps): Server {
     res.setHeader('x-request-id', requestId)
 
     const url = new URL(req.url ?? '/', `http://${headerOf(req, 'host') ?? 'localhost'}`)
-    const route = routes.find((r) => r.method === (req.method ?? 'GET') && r.path === url.pathname)
+    const method = req.method ?? 'GET'
+    let route: Route | undefined
+    let params: Readonly<Record<string, string>> = EMPTY_PARAMS
+    for (const candidate of routes) {
+      if (candidate.method !== method) continue
+      const matched = matchPath(candidate.path, url.pathname)
+      if (matched === null) continue
+      route = candidate
+      params = matched
+      break
+    }
     // Unmatched paths collapse to one label. Using the raw path would let any caller mint
-    // unbounded time series and take the scrape target down with cardinality.
+    // unbounded time series and take the scrape target down with cardinality — and that is why the
+    // label is the PATTERN rather than the matched path: `/v1/conversions/:id` is one series, while
+    // the ids that reach it are unbounded and attacker-chosen.
     const routeLabel = route ? route.path : 'unmatched'
 
     const log = deps.logger.child({ requestId, method: req.method ?? 'GET', route: routeLabel })
@@ -225,7 +286,7 @@ export function createServer(deps: ServerDeps): Server {
       })
     }
 
-    void handle(route, { req, url, requestId, log }, deps)
+    void handle(route, { req, url, requestId, log, params }, deps)
       .then((reply) => {
         send(res, reply, requestId)
         finish(reply.status)
@@ -264,8 +325,15 @@ async function handle(route: Route | undefined, ctx: RequestContext, deps: Serve
       ctx.log.error('token verifier unavailable', { err })
       return errorReply(503, 'verifier_unavailable', 'authentication is temporarily unavailable', ctx.requestId)
     }
+    if (err instanceof UpstreamRefusalError) {
+      // At info, not error. An upstream refusing a request it understood is a normal outcome of a
+      // form — a desk that is out of EMBER is the feature working — and logging it as a fault would
+      // put the one page whose refusals are expected at the top of the error rate.
+      ctx.log.info('upstream refused the request', { status: err.status, code: err.code })
+      return errorReply(err.status, err.code, err.message, ctx.requestId)
+    }
     if (err instanceof BadRequestError) {
-      return errorReply(400, 'bad_request', err.message, ctx.requestId)
+      return errorReply(400, err.code, err.message, ctx.requestId)
     }
     ctx.log.error('unhandled request failure', { err })
     return errorReply(500, 'internal', 'the request could not be completed', ctx.requestId)
@@ -456,6 +524,237 @@ function buildRoutes(): Route[] {
       },
     },
 
+    /* ------------------------------------------------------- the exchange desk (micro-org#496) */
+
+    /*
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * THE FIRST FIVE ROUTES ON THIS SERVICE THAT ARE NOT COMPOSITIONS, AND THE FIRST TWO THAT
+     * MOVE MONEY.
+     *
+     * Everything above this line fans out to several upstreams and returns tiles: a failure is a
+     * status on one tile and the page still draws. These five are PROXIES of one route each on
+     * micro-wallet, and they behave differently on purpose.
+     *
+     *   - The two reads are still tiles, because they are lists on a page that has other lists on
+     *     it, and a wallet outage should cost that page one panel rather than the whole screen.
+     *   - The DETAIL read is not a tile. A tile's `empty` for a single record would be a conversion
+     *     that does not exist, rendered as though it did.
+     *   - The two writes are not tiles either, and their refusals are forwarded verbatim — see
+     *     `UpstreamRefusalError`. A 409 `desk_inventory_short` that arrived at the browser as a 500
+     *     would turn "we are out of EMBER, try a smaller amount" into "something went wrong", which
+     *     is the difference between a user who knows what to do next and a support ticket.
+     *
+     * WHY hub-web CALLS THESE AT ALL, when it calls micro-wallet directly for withdrawals: because
+     * this is the seam micro-org#496 asked for, and because the two reads need `?userId=` for the
+     * operator view that `resolveSubject` already owns. The write routes forward the reader's own
+     * bearer and gain this service no authority it did not have — `Upstreams.quoteConversion` has
+     * the argument, and it is about `UPSTREAM_SCOPES.wallet` being a read credential.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+
+    {
+      method: 'POST',
+      path: '/v1/conversions/quote',
+      /**
+       * What a conversion would come to, without making one.
+       *
+       * A POST rather than a GET because wallet made it one, and for wallet's reason: this is the
+       * front half of the conversion — the same validation, the same pricing upstream, the same
+       * refusals — with the booking left off. Nothing is cached: a quote is a price at an instant,
+       * and a cached price is a price somebody trades at after it stopped being true.
+       *
+       * No idempotency key, because nothing is claimed. `hold: false` and `holdNotice` come back in
+       * the body and are forwarded untouched, which is what lets the confirm step say the quote is
+       * not a hold without this estate writing the sentence twice.
+       */
+      handle: async (ctx, deps) => {
+        const bearer = await convertingBearer(ctx, deps)
+        const intent = await readConversionIntent(ctx)
+        const done = deps.lifecycle.track()
+        try {
+          const quote = await forwardingRefusals(() =>
+            deps.upstreams.quoteConversion(bearer, intent, ctx.requestId),
+          )
+          return { status: 200, body: { quote } }
+        } finally {
+          done()
+        }
+      },
+    },
+
+    {
+      method: 'POST',
+      path: '/v1/conversions',
+      /**
+       * Make the conversion.
+       *
+       * 201 for a new one and 200 for a replay, both forwarded from wallet rather than decided here:
+       * that distinction is a fact about whether an entry was written, and only the service that
+       * writes entries knows it.
+       *
+       * The `Idempotency-Key` is REQUIRED and is the caller's own, forwarded verbatim. A key minted
+       * in this process would be a new key on every hop, so the retry that idempotency exists for —
+       * the browser sending the same press twice because the first response was lost — would book a
+       * second conversion. Refused here rather than at wallet only so the refusal names the header
+       * the caller has to add; the code is wallet's own, so a client handles one code either way.
+       */
+      handle: async (ctx, deps) => {
+        const bearer = await convertingBearer(ctx, deps)
+        const key = headerOf(ctx.req, 'idempotency-key')
+        if (!key || key.trim().length === 0) {
+          throw new BadRequestError(
+            'an Idempotency-Key header is required to make a conversion',
+            'idempotency_key_required',
+          )
+        }
+        const intent = await readConversionIntent(ctx)
+        const done = deps.lifecycle.track()
+        try {
+          const receipt = await forwardingRefusals(() =>
+            deps.upstreams.convert(bearer, intent, key, ctx.requestId),
+          )
+          ctx.log.info('conversion booked', {
+            entryId: receipt.entryId,
+            replayed: receipt.replayed,
+            fromAssetCode: intent.fromAssetCode,
+            toAssetCode: intent.toAssetCode,
+          })
+          return { status: receipt.replayed ? 200 : 201, body: receipt }
+        } finally {
+          done()
+        }
+      },
+    },
+
+    {
+      method: 'GET',
+      path: '/v1/conversions',
+      /**
+       * This reader's conversions, newest first, cursor-paged.
+       *
+       * Flat like `/v1/activity` rather than nested in a tile: `records`, `nextCursor`, `status`,
+       * `reason`, `cached` and `ageMs` at the top level. Two paged lists in one bundle reading two
+       * different shapes is how a client ends up with two pagers.
+       *
+       * The cursor is wallet's keyset position and is passed back byte-for-byte, for the reason
+       * `/v1/activity` states: re-encoding it would create a second cursor format to keep in step
+       * with the first for ever. Only the first page is cached, same rule and same reason.
+       */
+      handle: async (ctx, deps) => {
+        const subject = await resolveSubject(ctx, deps)
+        const limit = readLimit(ctx, PAGE.conversions)
+        const cursor = ctx.url.searchParams.get('cursor')
+        const done = deps.lifecycle.track()
+        try {
+          const tile = await loadTile<ConversionPage>(tileDepsOf(deps), {
+            tile: 'conversions',
+            upstream: 'wallet',
+            key:
+              cursor === null
+                ? `wallet:conversions:${subject.userId}:${limit}`
+                : `wallet:conversions:uncached:${subject.userId}:${cursor}:${limit}`,
+            ttlMs: cursor === null ? CACHE.walletConversions.ttlMs : 0,
+            staleMs: cursor === null ? CACHE.walletConversions.staleMs : 0,
+            empty: { conversions: [], nextCursor: null },
+            load: () =>
+              deps.upstreams.walletConversions(subject.userId, limit, cursor, ctx.requestId),
+          })
+          return {
+            status: 200,
+            body: {
+              conversions: tile.data.conversions,
+              nextCursor: tile.data.nextCursor,
+              status: tile.status,
+              reason: tile.reason,
+              cached: tile.cached,
+              ageMs: tile.ageMs,
+            },
+          }
+        } finally {
+          done()
+        }
+      },
+    },
+
+    {
+      method: 'GET',
+      path: '/v1/transfers',
+      /**
+       * This reader's transfers, sent and received, newest first.
+       *
+       * Composed here even though nothing in this estate can yet SEND one: `POST /v1/transfers`
+       * takes an internal `toUserId` and no surface can resolve a handle to one, so the send form is
+       * still absent. The list is not, and that is the point — `pages/wallet.tsx` carried a
+       * paragraph saying transfers had nowhere to show a result, and the paragraph outlived the hole
+       * it described the moment wallet grew this route.
+       */
+      handle: async (ctx, deps) => {
+        const subject = await resolveSubject(ctx, deps)
+        const limit = readLimit(ctx, PAGE.conversions)
+        const cursor = ctx.url.searchParams.get('cursor')
+        const done = deps.lifecycle.track()
+        try {
+          const tile = await loadTile<TransferPage>(tileDepsOf(deps), {
+            tile: 'transfers',
+            upstream: 'wallet',
+            key:
+              cursor === null
+                ? `wallet:transfers:${subject.userId}:${limit}`
+                : `wallet:transfers:uncached:${subject.userId}:${cursor}:${limit}`,
+            ttlMs: cursor === null ? CACHE.walletConversions.ttlMs : 0,
+            staleMs: cursor === null ? CACHE.walletConversions.staleMs : 0,
+            empty: { transfers: [], nextCursor: null },
+            load: () => deps.upstreams.walletTransfers(subject.userId, limit, cursor, ctx.requestId),
+          })
+          return {
+            status: 200,
+            body: {
+              transfers: tile.data.transfers,
+              nextCursor: tile.data.nextCursor,
+              status: tile.status,
+              reason: tile.reason,
+              cached: tile.cached,
+              ageMs: tile.ageMs,
+            },
+          }
+        } finally {
+          done()
+        }
+      },
+    },
+
+    {
+      method: 'GET',
+      path: '/v1/conversions/:id',
+      /**
+       * One conversion, by the id of the journal entry that is it.
+       *
+       * **Deliberately not a tile.** Every other list read here degrades to `empty` and says so, and
+       * `empty` for a single record would be a conversion with no id, no assets and no amounts,
+       * rendered by a detail page as though the record existed and were blank. A read of one thing
+       * either produces that thing or fails.
+       *
+       * wallet answers 404 for a missing id, for an entry that is not a conversion and for somebody
+       * else's alike, and that 404 is forwarded rather than translated: the three are indistinguishable
+       * there on purpose, because a 403 on an id that exists and a 404 on one that does not is an
+       * oracle for enumerating other people's entry ids. Translating it here would rebuild the oracle
+       * one layer up.
+       */
+      handle: async (ctx, deps) => {
+        const subject = await resolveSubject(ctx, deps)
+        const id = ctx.params['id'] ?? ''
+        const done = deps.lifecycle.track()
+        try {
+          const conversion = await forwardingRefusals(() =>
+            deps.upstreams.walletConversion(subject.userId, id, ctx.requestId),
+          )
+          return { status: 200, body: { conversion } }
+        } finally {
+          done()
+        }
+      },
+    },
+
     {
       method: 'GET',
       path: '/v1/search',
@@ -607,6 +906,28 @@ async function resolveSubject(ctx: RequestContext, deps: ServerDeps): Promise<Su
   return { userId: requested, forwardableBearer: null }
 }
 
+/**
+ * The bearer the desk routes forward, or a refusal.
+ *
+ * An operator may READ another user's conversions with `?userId=` — that is what the admin branch of
+ * `resolveSubject` is for, and it is how support answers "where did my EMBER go". They may not MAKE
+ * one. `forwardableBearer` is null exactly then, and rather than fall back to a service token this
+ * refuses with a sentence.
+ *
+ * The alternative is worse than it looks. Converting with hub-api's own credential would book a
+ * trade against somebody's balance with nothing in the ledger naming the person who decided to, and
+ * the entry's actor would read as this service. If an operator ever needs to convert on a user's
+ * behalf, it wants to be a route on wallet that says so and records who — `POST
+ * /v1/admin/exchange-desk/funding` is the shape, and it takes an admin's own bearer.
+ */
+async function convertingBearer(ctx: RequestContext, deps: ServerDeps): Promise<string> {
+  const subject = await resolveSubject(ctx, deps)
+  if (subject.forwardableBearer === null) {
+    throw new ForbiddenError("your own session (an operator cannot convert on a user's behalf)")
+  }
+  return subject.forwardableBearer
+}
+
 /* ------------------------------------------------------------------ plumbing */
 
 function tileDepsOf(deps: ServerDeps): TileDeps {
@@ -626,10 +947,190 @@ function dashboardDeps(deps: ServerDeps): DashboardDeps {
 }
 
 class BadRequestError extends Error {
-  constructor(message: string) {
+  /**
+   * The code the client reads. `bad_request` unless a caller names one, and a caller names one when
+   * an upstream already has a code for the same refusal: a browser that has to branch on
+   * `idempotency_key_required` should not have to also handle `bad_request` because the request was
+   * caught one hop earlier than usual.
+   */
+  readonly code: string
+  constructor(message: string, code = 'bad_request') {
     super(message)
     this.name = 'BadRequestError'
+    this.code = code
   }
+}
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * AN UPSTREAM'S REFUSAL, CARRIED THROUGH WITH ITS STATUS, ITS CODE AND ITS SENTENCE.
+ *
+ * Everything else in this service turns an upstream failure into a tile status, and `describeFault`
+ * in `tiles.ts` states the rule those follow: the reason is built from the error's CLASS and never
+ * from a response body, because "putting that in a field a browser renders is a stored-XSS primitive
+ * with extra steps". This is the one place that rule is departed from, and the departure is narrow
+ * enough to state exactly:
+ *
+ *   - It applies only to the desk routes, which are proxies of ONE named route on ONE named peer.
+ *     A tile's fault could have come from any of eight upstreams, including one that answers HTML
+ *     from a captive portal; this could not.
+ *   - Only a status the peer DECIDED is forwarded (`FORWARDED_STATUSES`). A 500, a timeout, a
+ *     transport error and an open breaker are not decisions about this request and are still the
+ *     generic 500 above.
+ *   - Only a body that parses as the estate's own error envelope is forwarded, the code must look
+ *     like a code, and the message is bounded. Anything else falls back to the generic path — so an
+ *     upstream that starts answering something unexpected degrades to "the request could not be
+ *     completed" rather than to whatever it answered.
+ *
+ * What it buys is the whole point of micro-org#496: `desk_inventory_short` says "the desk is out of
+ * EMBER right now — try a smaller amount, or try again shortly", and a person who reads that knows
+ * what to do. Re-writing it here would be a second copy of wallet's words, free to drift from the
+ * first, and the estate has that failure written down in three other places.
+ *
+ * The `requestId` in the reply is still THIS service's. The upstream's is in the log line.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+class UpstreamRefusalError extends Error {
+  readonly status: number
+  readonly code: string
+  constructor(status: number, code: string, message: string) {
+    super(message)
+    this.name = 'UpstreamRefusalError'
+    this.status = status
+    this.code = code
+  }
+}
+
+/**
+ * The statuses that mean the peer read the request and said no.
+ *
+ * 503 is in the list and is the one that needs an argument, because a 5xx normally means "we do not
+ * know". wallet's `rate_unavailable` is a 503 and it IS a decision about this request — pricing has
+ * no usable quote for this pair, so the conversion is refused rather than guessed at a made-up rate.
+ * A user who sees "try again shortly" acts correctly on it; a 500 would send them to support.
+ * The envelope check below is what keeps a genuine unlabelled 503 out.
+ *
+ * 401 and 403 are deliberately ABSENT. This service verified the reader's token before forwarding
+ * it, so wallet disagreeing means the two disagree about identity — a fault in the estate, not in
+ * the request. Forwarding a 401 would make the browser refresh and then sign the reader out over it.
+ */
+const FORWARDED_STATUSES: ReadonlySet<number> = new Set([400, 404, 409, 422, 429, 503])
+
+/** A code looks like a code. Anything else is not an envelope this service will echo. */
+const REFUSAL_CODE = /^[a-z][a-z0-9_]{0,63}$/
+
+/** Long enough for wallet's longest refusal sentence, short enough not to be a payload. */
+const MAX_REFUSAL_MESSAGE = 400
+
+function refusalFrom(err: unknown): UpstreamRefusalError | null {
+  if (!(err instanceof HttpError)) return null
+  if (!FORWARDED_STATUSES.has(err.status)) return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(err.body)
+  } catch {
+    return null
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null
+  const envelope = (parsed as { error?: unknown }).error
+  if (typeof envelope !== 'object' || envelope === null) return null
+  const { code, message } = envelope as { code?: unknown; message?: unknown }
+  if (typeof code !== 'string' || !REFUSAL_CODE.test(code)) return null
+  if (typeof message !== 'string' || message.length === 0) return null
+  if (message.length > MAX_REFUSAL_MESSAGE) return null
+  return new UpstreamRefusalError(err.status, code, message)
+}
+
+/** Run an upstream call, turning a refusal it decided into one this service will forward. */
+async function forwardingRefusals<T>(call: () => Promise<T>): Promise<T> {
+  try {
+    return await call()
+  } catch (err) {
+    throw refusalFrom(err) ?? err
+  }
+}
+
+/* ------------------------------------------------------------------ request bodies */
+
+/**
+ * The first request body this service has ever read, and the cap is why this is a function.
+ *
+ * `node:http` streams a body of any size, and a route that concatenates chunks without a ceiling is
+ * a memory exhaustion primitive available to anyone with a session. 8 KiB is far above the largest
+ * legitimate body here — a conversion intent is three short strings — and far below anything worth
+ * sending on purpose.
+ */
+const MAX_BODY_BYTES = 8 * 1024
+
+async function readJsonBody(ctx: RequestContext): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = []
+  let bytes = 0
+  for await (const chunk of ctx.req) {
+    const buffer = chunk as Buffer
+    bytes += buffer.length
+    if (bytes > MAX_BODY_BYTES) {
+      throw new BadRequestError(`the request body must be at most ${MAX_BODY_BYTES} bytes`)
+    }
+    chunks.push(buffer)
+  }
+  if (bytes === 0) throw new BadRequestError('a JSON body is required')
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+  } catch {
+    // The parser's own message is not echoed: it quotes the input, which is how a body ends up in a
+    // response and then in a log aggregator's search results.
+    throw new BadRequestError('the request body must be JSON')
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new BadRequestError('the request body must be a JSON object')
+  }
+  return parsed as Record<string, unknown>
+}
+
+/** Asset codes are short. Anything longer is not a code and is not worth forwarding. */
+const MAX_ASSET_CODE = 32
+
+/**
+ * The conversion intent, checked for SHAPE and forwarded for MEANING.
+ *
+ * The distinction is deliberate and it is the whole of this function's design. A missing field or a
+ * number where a string belongs is this layer's business, because wallet would answer a 400 that
+ * says nothing a browser could act on. What an amount MEANS — positive, non-zero, large enough to
+ * convert to one unit of the target, an asset the desk deals in — is wallet's, and every one of
+ * those has a code and a sentence there already. Re-deciding any of them here would be a second
+ * opinion about money that ships on a different cadence than the first.
+ *
+ * `amount` is a STRING and stays one. These are smallest units of a 78-bit quantity, and a JSON
+ * number would round the large ones silently — the estate's standing rule, and the reason wallet's
+ * own views never carry a numeric amount either.
+ */
+async function readConversionIntent(ctx: RequestContext): Promise<ConversionIntent> {
+  const body = await readJsonBody(ctx)
+  return {
+    fromAssetCode: requiredCode(body, 'fromAssetCode'),
+    toAssetCode: requiredCode(body, 'toAssetCode'),
+    amount: requiredAmount(body),
+  }
+}
+
+function requiredCode(body: Record<string, unknown>, field: string): string {
+  const value = body[field]
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new BadRequestError(`${field} is required`)
+  }
+  if (value.length > MAX_ASSET_CODE) {
+    throw new BadRequestError(`${field} must be at most ${MAX_ASSET_CODE} characters`)
+  }
+  return value.trim()
+}
+
+function requiredAmount(body: Record<string, unknown>): string {
+  const value = body['amount']
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new BadRequestError('amount is required, in smallest units, as a string')
+  }
+  return value.trim()
 }
 
 function readLimit(ctx: RequestContext, fallback: number): number {
