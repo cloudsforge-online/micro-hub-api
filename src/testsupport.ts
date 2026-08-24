@@ -26,7 +26,7 @@ import { AUDIENCE, Verifier } from '@cloudsforge/auth'
 import { Logger, Metrics, registerHttpMetrics } from '@cloudsforge/telemetry'
 import { Lifecycle } from '@cloudsforge/lifecycle'
 import { TtlCache } from './cache.ts'
-import { httpUpstreams, type Upstreams } from './upstreams.ts'
+import { httpUpstreams, type UpstreamsFor } from './upstreams.ts'
 import { createServer as createHubServer, registerServiceMetrics } from './server.ts'
 import type { Env } from './env.ts'
 
@@ -885,6 +885,7 @@ export function estateEnv(estate: Estate, overrides: Partial<Env> = {}): Env {
     },
     identityCredential: token,
     legacyServiceTokenPresent: false,
+    singleNetwork: 'mainnet',
     dashboardDeadlineMs: 2_000,
     upstreamDeadlineMs: 1_000,
     circuitThreshold: 5,
@@ -902,7 +903,7 @@ export interface Harness {
   readonly estate: Estate
   readonly metrics: Metrics
   readonly cache: TtlCache
-  readonly upstreams: Upstreams
+  readonly upstreams: UpstreamsFor
   readonly lifecycle: Lifecycle
 }
 
@@ -935,7 +936,9 @@ export async function withHub(
     logger,
     metrics,
     verifier: testVerifier(),
-    upstreams,
+    upstreamsFor: upstreams,
+    upstreams: upstreams.for('mainnet'),
+    singleNetwork: 'mainnet' as const,
     cache,
     dashboardDeadlineMs: env.dashboardDeadlineMs,
     poolApi: env.poolApi,

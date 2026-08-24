@@ -208,6 +208,13 @@ export interface Env {
    * upstreams at 400ms each cost 400ms, and this number is what a single pathological upstream is
    * allowed to cost. Past it the tile is `unavailable` and the page is still served.
    */
+  /**
+   * `CF_NETWORK_SINGLE`: the estate to assume when no `CF-Network` header arrives. For `pnpm dev`,
+   * which has no gateway in front of it. NEVER set in production — hub-api holds no database, so
+   * the header is the whole of its isolation, and a default would render one estate's dashboard
+   * out of the other estate's numbers. See micro-deploy `docs/network-consolidation.md`.
+   */
+  readonly singleNetwork: string
   readonly dashboardDeadlineMs: number
   /**
    * The default ceiling on one upstream call, retries included. Necessarily below the dashboard
@@ -305,6 +312,7 @@ export function loadEnv(source: Source = process.env, hostname = ''): Env {
       'HUB_PRICING_TOKEN',
       'HUB_POLICY_TOKEN',
     ].some((name) => (source[name]?.trim() ?? '').length > 0),
+    singleNetwork: optional(source, 'CF_NETWORK_SINGLE', ''),
     dashboardDeadlineMs,
     upstreamDeadlineMs,
     circuitThreshold: integer(source, 'HUB_CIRCUIT_THRESHOLD', 5, 1, 100),

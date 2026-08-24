@@ -46,12 +46,15 @@ test('livez is static and stays 200 while the service is unready', async () => {
   const lifecycle = new Lifecycle({ cacheMs: 0 })
   lifecycle.addProbe(failingProbe('ledger', 'soft'))
   const metrics = registerServiceMetrics(registerHttpMetrics(new Metrics()))
+  const upstreams = httpUpstreams({ env, metrics })
   const server = createServer({
     lifecycle,
     logger: new Logger({ service: 'test', sink: () => {} }),
     metrics,
     verifier: testVerifier(),
-    upstreams: httpUpstreams({ env, metrics }),
+    upstreamsFor: upstreams,
+    upstreams: upstreams.for('mainnet'),
+    singleNetwork: 'mainnet' as const,
     cache: new TtlCache(),
     dashboardDeadlineMs: env.dashboardDeadlineMs,
     poolApi: env.poolApi,
@@ -166,6 +169,7 @@ test('a verifier that cannot reach its JWKS is 503, never 401', async () => {
   const env = estateEnv(estate)
   const metrics = registerServiceMetrics(registerHttpMetrics(new Metrics()))
   const lifecycle = new Lifecycle({ cacheMs: 0 })
+  const upstreams = httpUpstreams({ env, metrics })
   const server = createServer({
     lifecycle,
     logger: new Logger({ service: 'test', sink: () => {} }),
@@ -177,7 +181,9 @@ test('a verifier that cannot reach its JWKS is 503, never 401', async () => {
         throw new Error('getaddrinfo EAI_AGAIN identity')
       }) as never,
     }),
-    upstreams: httpUpstreams({ env, metrics }),
+    upstreamsFor: upstreams,
+    upstreams: upstreams.for('mainnet'),
+    singleNetwork: 'mainnet' as const,
     cache: new TtlCache(),
     dashboardDeadlineMs: env.dashboardDeadlineMs,
     poolApi: env.poolApi,

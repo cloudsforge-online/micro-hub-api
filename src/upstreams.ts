@@ -572,7 +572,6 @@ export interface Upstreams {
   policyFreezes(userId: string, requestId: string): Promise<readonly PolicyFreeze[]>
   notifications(userId: string, limit: number, requestId: string): Promise<NotificationPage>
   /** Breaker state per upstream, for `/readyz` and for the operator who asks "is it us". */
-  circuitStates(): Readonly<Record<string, string>>
   /**
    * The six token providers, so `/readyz` can report the credential.
    *
@@ -580,7 +579,6 @@ export interface Upstreams {
    * `serviceTokenProbe` fails on. They are exposed rather than hidden because a dashboard whose
    * tiles are all `unavailable` should say WHY on the readiness endpoint, not only in a log.
    */
-  readonly tokenProviders: UpstreamProviders
 }
 
 /** How many rows each list read asks for. See `dashboard.ts` for why the dashboard asks for few. */
@@ -695,7 +693,27 @@ export type UpstreamProviders = Readonly<
  * covers the single dropped connection, which is what retries are actually for, and the breaker
  * covers the case where retrying is pointless.
  */
-export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
+/**
+ * A per-network view of the same peers.
+ *
+ * The HttpClients are built ONCE and shared across networks on purpose: a circuit breaker tracks
+ * whether the wallet SERVICE is answering, and a wallet that is down is down for both estates.
+ * Two breakers over one process would each need half the evidence to trip and would trip late.
+ *
+ * What is per-network is the `CF-Network` header on every outbound call, so the consolidated peer
+ * answers from the estate this request belongs to. Without it hub-api would ask the right service
+ * the wrong question and render the answer without a word of complaint.
+ */
+export interface UpstreamsFor {
+  /** The peers as seen from ONE estate. Every outbound call carries that estate's `CF-Network`. */
+  for(network: Network): Upstreams
+  /** Process-wide, because it describes the PEER: a wallet that is down is down for both estates. */
+  circuitStates(): Readonly<Record<string, string>>
+  /** Process-wide: one credential set, narrowed per peer, serves both estates. */
+  readonly tokenProviders: UpstreamProviders
+}
+
+export function httpUpstreams(options: HttpUpstreamOptions): UpstreamsFor {
   const { env, metrics } = options
   const circuit = { threshold: env.circuitThreshold, resetMs: env.circuitResetMs }
 
@@ -807,14 +825,14 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
   const policy = make('policy', env.upstreams.policy, providers.policy)
   const notify = make('notify', env.upstreams.notify, providers.notify)
 
-  return {
+  const forNetwork = (network: Network): Upstreams => ({
     async ledgerBalances(userId, requestId) {
       // `user:<uuid>` percent-encoded whole: the colon is a path-segment delimiter in some
       // proxies, and ledger decodes the segment before parsing it.
       const subject = encodeURIComponent(`user:${userId}`)
       const body = await ledger.get<{ balances: readonly LedgerBalance[] }>(
         `/accounts/${subject}/balances`,
-        { requestId },
+        { requestId, network },
       )
       return body.balances
     },
@@ -822,7 +840,7 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
     async walletRegistry(userId, requestId) {
       const body = await wallet.get<{ wallets: readonly WalletRecord[] }>(
         `/v1/wallets?userId=${encodeURIComponent(userId)}&limit=${PAGE.wallets}`,
-        { requestId },
+        { requestId, network },
       )
       return body.wallets
     },
@@ -830,7 +848,7 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
     async walletDeposits(userId, requestId) {
       const body = await wallet.get<{ credits: readonly DepositCredit[] }>(
         `/v1/deposits/credits?userId=${encodeURIComponent(userId)}&limit=${PAGE.deposits}`,
-        { requestId },
+        { requestId, network },
       )
       return body.credits
     },
@@ -838,7 +856,7 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
     async walletWithdrawals(userId, requestId) {
       const body = await wallet.get<{ withdrawals: readonly WithdrawalRecord[] }>(
         `/v1/withdrawals?userId=${encodeURIComponent(userId)}&limit=${PAGE.withdrawals}`,
-        { requestId },
+        { requestId, network },
       )
       return body.withdrawals
     },
@@ -846,14 +864,14 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
     async walletConversions(userId, limit, cursor, requestId) {
       const query = new URLSearchParams({ userId, limit: String(limit) })
       if (cursor) query.set('cursor', cursor)
-      return wallet.get<ConversionPage>(`/v1/conversions?${query.toString()}`, { requestId })
+      return wallet.get<ConversionPage>(`/v1/conversions?${query.toString()}`, { requestId, network })
     },
 
     async walletConversion(userId, entryId, requestId) {
       const query = new URLSearchParams({ userId })
       const body = await wallet.get<{ conversion: ConversionRecord }>(
         `/v1/conversions/${encodeURIComponent(entryId)}?${query.toString()}`,
-        { requestId },
+        { requestId, network },
       )
       return body.conversion
     },
@@ -861,7 +879,7 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
     async walletTransfers(userId, limit, cursor, requestId) {
       const query = new URLSearchParams({ userId, limit: String(limit) })
       if (cursor) query.set('cursor', cursor)
-      return wallet.get<TransferPage>(`/v1/transfers?${query.toString()}`, { requestId })
+      return wallet.get<TransferPage>(`/v1/transfers?${query.toString()}`, { requestId, network })
     },
 
     async quoteConversion(bearer, intent, requestId) {
@@ -883,6 +901,7 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
         headers: { authorization: `Bearer ${bearer}` },
         idempotencyKey,
         requestId,
+        network,
       })
     },
 
@@ -890,6 +909,7 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
       return identity.get<IdentityMe>('/auth/me', {
         headers: { authorization: `Bearer ${bearer}` },
         requestId,
+        network,
       })
     },
 
@@ -897,6 +917,7 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
       return identity.get<IdentityFactors>('/mfa/factors', {
         headers: { authorization: `Bearer ${bearer}` },
         requestId,
+        network,
       })
     },
 
@@ -906,7 +927,7 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
       // decorative" — and this service holds exactly the token it names.
       const body = await billing.get<{ entitlements: readonly BillingEntitlement[] }>(
         `/internal/entitlements/${encodeURIComponent(userId)}?limit=${PAGE.entitlements}`,
-        { requestId },
+        { requestId, network },
       )
       return body.entitlements
     },
@@ -914,7 +935,7 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
     async billingSubscriptions(userId, requestId) {
       const body = await billing.get<{ subscriptions: readonly BillingSubscription[] }>(
         `/subscriptions?userId=${encodeURIComponent(userId)}&limit=${PAGE.subscriptions}`,
-        { requestId },
+        { requestId, network },
       )
       return body.subscriptions
     },
@@ -925,7 +946,7 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
       const body = await activity.get<{
         records: readonly ActivityRecord[]
         nextCursor?: string
-      }>(`/feed?${query.toString()}`, { requestId })
+      }>(`/feed?${query.toString()}`, { requestId, network })
       // Normalised to `null` here rather than left absent. Activity omits the key on the last
       // page; a client that reads `nextCursor === undefined` and one that reads `=== null` are two
       // clients, and this is the layer whose job it is to make them one.
@@ -933,7 +954,7 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
     },
 
     async pricingRates(requestId) {
-      const body = await pricing.get<{ rates: readonly PricingRate[] }>('/rates', { requestId })
+      const body = await pricing.get<{ rates: readonly PricingRate[] }>('/rates', { requestId, network })
       return body.rates
     },
 
@@ -941,7 +962,7 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
       const subject = encodeURIComponent(`user:${userId}`)
       const body = await policy.get<{ freezes: readonly PolicyFreeze[] }>(
         `/subjects/${subject}/freezes`,
-        { requestId },
+        { requestId, network },
       )
       return body.freezes
     },
@@ -953,9 +974,13 @@ export function httpUpstreams(options: HttpUpstreamOptions): Upstreams {
       // shows the newest few whatever their read state, and the unread total comes back on the
       // page regardless, so filtering here would cost the preview its context and buy nothing.
       const query = new URLSearchParams({ userId, limit: String(limit) })
-      return notify.get<NotificationPage>(`/notifications?${query.toString()}`, { requestId })
+      return notify.get<NotificationPage>(`/notifications?${query.toString()}`, { requestId, network })
     },
 
+  })
+
+  return {
+    for: forNetwork,
     circuitStates() {
       return {
         ledger: ledger.circuitState,
