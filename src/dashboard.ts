@@ -278,8 +278,14 @@ export async function composeDashboard(
   }
 
   const tileDeps: TileDeps = deps.now
-    ? { cache: deps.cache, metrics: deps.metrics, logger: deps.logger, now: deps.now }
-    : { cache: deps.cache, metrics: deps.metrics, logger: deps.logger }
+    ? {
+        cache: deps.cache,
+        metrics: deps.metrics,
+        logger: deps.logger,
+        network: deps.network,
+        now: deps.now,
+      }
+    : { cache: deps.cache, metrics: deps.metrics, logger: deps.logger, network: deps.network }
 
   // Every read is started before the first is awaited. This line and the `Promise.all` below are
   // the whole of "the budget is the slowest tile, not the sum".

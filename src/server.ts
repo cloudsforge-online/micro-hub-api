@@ -40,7 +40,7 @@ import {
   statusFor,
   type Principal,
 } from '@cloudsforge/auth'
-import { HttpError } from '@cloudsforge/http'
+import { HttpError, NetworkUnknownError, requestNetwork, type Network } from '@cloudsforge/http'
 import type { Lifecycle } from '@cloudsforge/lifecycle'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import type { TtlCache } from './cache.ts'
@@ -62,6 +62,7 @@ import {
   type PricingRate,
   type TransferPage,
   type Upstreams,
+  type UpstreamsFor,
   type WithdrawalRecord,
 } from './upstreams.ts'
 
@@ -75,6 +76,17 @@ export interface ServerDeps {
   readonly logger: Logger
   readonly metrics: Metrics
   readonly verifier: PrincipalVerifier
+  /**
+   * The peers, as a per-network SELECTOR. `forRequest` narrows it to this request's estate before
+   * any route sees it, so every outbound call carries the right `CF-Network`.
+   *
+   * hub-api holds no database, so this — and the cache key — is the whole of its isolation. Get it
+   * wrong and it asks the right service the WRONG QUESTION, then renders the answer.
+   */
+  readonly upstreamsFor: UpstreamsFor
+  /** `CF_NETWORK_SINGLE`, for `pnpm dev`, which has no gateway to stamp the header. */
+  readonly singleNetwork?: Network
+  /** Narrowed per request by `forRequest`; the boot-time value answers for the default network. */
   readonly upstreams: Upstreams
   readonly cache: TtlCache
   readonly dashboardDeadlineMs: number
@@ -178,6 +190,15 @@ interface Reply {
   readonly contentType?: string
 }
 
+/**
+ * Routes that answer without belonging to a network.
+ *
+ * Kubelet probes the first two and Prometheus scrapes the third; none arrives through the gateway,
+ * so none carries `CF-Network`. Refusing them turns a data-isolation rule into a CrashLoopBackOff —
+ * which is exactly what agora's first build did: 500 on every probe, container never ready.
+ */
+const OPERATIONAL_ROUTES: ReadonlySet<string> = new Set(['/livez', '/readyz', '/metrics'])
+
 interface RequestContext {
   readonly req: IncomingMessage
   readonly url: URL
@@ -185,6 +206,14 @@ interface RequestContext {
   readonly log: Logger
   /** Segments captured by a `:name` in the matched route's path. Empty for a literal route. */
   readonly params: Readonly<Record<string, string>>
+  /**
+   * The estate THIS REQUEST belongs to, from the `CF-Network` header the gateway stamped.
+   *
+   * hub-api holds no database, so this value is the whole of its isolation: it selects the peers
+   * every tile is fetched from AND prefixes every cache key. Not a property of the process — one
+   * pod serves both estates, so "which network am I" has no answer.
+   */
+  readonly network: Network
 }
 
 interface Route {
@@ -271,7 +300,7 @@ export function createServer(deps: ServerDeps): Server {
     inFlight += 1
     deps.metrics.set('http_requests_in_flight', inFlight)
 
-    const finish = (status: number) => {
+    const finish = (status: number, metricNetwork: string) => {
       inFlight -= 1
       deps.metrics.set('http_requests_in_flight', inFlight)
       const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6
@@ -279,25 +308,64 @@ export function createServer(deps: ServerDeps): Server {
         method: req.method ?? 'GET',
         route: routeLabel,
         status: String(status),
+        // One target now serves both estates, so the network has to be on the SERIES. Labelled
+        // per target it would say nothing — micro-org#398 in a form nothing could recover.
+        network: metricNetwork,
       })
       deps.metrics.observe('http_request_duration_ms', durationMs, {
         method: req.method ?? 'GET',
         route: routeLabel,
+        network: metricNetwork,
       })
     }
 
-    void handle(route, { req, url, requestId, log, params }, deps)
+    // ── THE NETWORK, BEFORE ANY ROUTE RUNS ────────────────────────────────────────────────────
+    //
+    // `requestNetwork` REFUSES an unstamped request rather than assuming mainnet: a 500 is a
+    // routing fault made loud, where a default is a dashboard rendered from the other estate with
+    // nothing to say so.
+    const networkless = route !== undefined && OPERATIONAL_ROUTES.has(route.path)
+    let network: Network
+    try {
+      network = networkless
+        ? (deps.singleNetwork ?? 'mainnet')
+        : requestNetwork(req.headers, deps.singleNetwork ? { fallback: deps.singleNetwork } : {})
+    } catch (err) {
+      log.error('request carries no usable network', {
+        err: err instanceof NetworkUnknownError ? err.message : err,
+      })
+      send(
+        res,
+        errorReply(500, 'network_unknown', 'this request could not be attributed to a network', requestId),
+        requestId,
+      )
+      finish(500, 'unknown')
+      return
+    }
+
+    void handle(route, { req, url, requestId, log, params, network }, forRequest(deps, network))
       .then((reply) => {
         send(res, reply, requestId)
-        finish(reply.status)
+        finish(reply.status, network)
       })
       .catch((err: unknown) => {
         // Reaching here means the error mapping itself failed. Answer, then say so loudly.
         log.error('request handler threw after mapping', { err })
         send(res, errorReply(500, 'internal', 'the request could not be completed', requestId), requestId)
-        finish(500)
+        finish(500, network)
       })
   })
+}
+
+/**
+ * The deps a REQUEST sees: the peers narrowed to this request's estate.
+ *
+ * hub-api holds no database. Its entire isolation is this line plus the cache key — narrow the
+ * peers to the wrong estate and it asks the right services the wrong question, then renders the
+ * answer as a dashboard with no indication that anything is amiss.
+ */
+function forRequest(deps: ServerDeps, network: Network): ServerDeps {
+  return { ...deps, upstreams: deps.upstreamsFor.for(network) }
 }
 
 async function handle(route: Route | undefined, ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
@@ -363,7 +431,7 @@ function buildRoutes(): Route[] {
         // take the whole dashboard out of rotation to avoid showing one degraded tile.
         return {
           status: report.ready ? 200 : 503,
-          body: { ...report, circuits: deps.upstreams.circuitStates() },
+          body: { ...report, circuits: deps.upstreamsFor.circuitStates() },
         }
       },
     },
@@ -420,7 +488,7 @@ function buildRoutes(): Route[] {
         const subject = await resolveSubject(ctx, deps)
         const done = deps.lifecycle.track()
         try {
-          const dashboard = await composeDashboard(dashboardDeps(deps), {
+          const dashboard = await composeDashboard(dashboardDeps(deps, ctx.network), {
             userId: subject.userId,
             bearer: subject.forwardableBearer,
             requestId: ctx.requestId,
@@ -445,7 +513,7 @@ function buildRoutes(): Route[] {
       path: '/v1/portfolio',
       handle: async (ctx, deps) => {
         const subject = await resolveSubject(ctx, deps)
-        const tileDeps = tileDepsOf(deps)
+        const tileDeps = tileDepsOf(deps, ctx.network)
         const done = deps.lifecycle.track()
         try {
           const [balances, prices] = await Promise.all([
@@ -495,7 +563,7 @@ function buildRoutes(): Route[] {
         const cursor = ctx.url.searchParams.get('cursor')
         const done = deps.lifecycle.track()
         try {
-          const tile = await loadTile<ActivityPage>(tileDepsOf(deps), {
+          const tile = await loadTile<ActivityPage>(tileDepsOf(deps, ctx.network), {
             tile: 'activity',
             upstream: 'activity',
             key:
@@ -646,7 +714,7 @@ function buildRoutes(): Route[] {
         const cursor = ctx.url.searchParams.get('cursor')
         const done = deps.lifecycle.track()
         try {
-          const tile = await loadTile<ConversionPage>(tileDepsOf(deps), {
+          const tile = await loadTile<ConversionPage>(tileDepsOf(deps, ctx.network), {
             tile: 'conversions',
             upstream: 'wallet',
             key:
@@ -694,7 +762,7 @@ function buildRoutes(): Route[] {
         const cursor = ctx.url.searchParams.get('cursor')
         const done = deps.lifecycle.track()
         try {
-          const tile = await loadTile<TransferPage>(tileDepsOf(deps), {
+          const tile = await loadTile<TransferPage>(tileDepsOf(deps, ctx.network), {
             tile: 'transfers',
             upstream: 'wallet',
             key:
@@ -770,7 +838,7 @@ function buildRoutes(): Route[] {
         const done = deps.lifecycle.track()
         try {
           const results = await search(
-            { ...tileDepsOf(deps), upstreams: deps.upstreams },
+            { ...tileDepsOf(deps, ctx.network), upstreams: deps.upstreams },
             { userId: subject.userId, query, requestId: ctx.requestId },
           )
           return { status: 200, body: results }
@@ -790,7 +858,7 @@ function buildRoutes(): Route[] {
        */
       handle: async (ctx, deps) => {
         const subject = await resolveSubject(ctx, deps)
-        const tileDeps = tileDepsOf(deps)
+        const tileDeps = tileDepsOf(deps, ctx.network)
         const done = deps.lifecycle.track()
         try {
           const [deposits, withdrawals, security, freezes, subscriptions] = await Promise.all([
@@ -930,17 +998,17 @@ async function convertingBearer(ctx: RequestContext, deps: ServerDeps): Promise<
 
 /* ------------------------------------------------------------------ plumbing */
 
-function tileDepsOf(deps: ServerDeps): TileDeps {
+function tileDepsOf(deps: ServerDeps, network: Network): TileDeps {
   // Built conditionally because `exactOptionalPropertyTypes` distinguishes an absent `now` from a
   // present `undefined`, and the difference decides whether the default clock is used.
   return deps.now
-    ? { cache: deps.cache, metrics: deps.metrics, logger: deps.logger, now: deps.now }
-    : { cache: deps.cache, metrics: deps.metrics, logger: deps.logger }
+    ? { cache: deps.cache, metrics: deps.metrics, logger: deps.logger, network, now: deps.now }
+    : { cache: deps.cache, metrics: deps.metrics, logger: deps.logger, network }
 }
 
-function dashboardDeps(deps: ServerDeps): DashboardDeps {
+function dashboardDeps(deps: ServerDeps, network: Network): DashboardDeps {
   return {
-    ...tileDepsOf(deps),
+    ...tileDepsOf(deps, network),
     upstreams: deps.upstreams,
     dashboardDeadlineMs: deps.dashboardDeadlineMs,
   }

@@ -172,7 +172,7 @@ test('a tile still renders ELEVEN MINUTES after boot — the ten-minute cliff', 
   const upstreams = upstreamsFor(w, CREDENTIAL)
 
   // T+0. Every existing test in this repository stops looking here, and everything is fine.
-  await upstreams.pricingRates('req-1')
+  await upstreams.for('mainnet').pricingRates('req-1')
   const atBoot = w.peerCalls.at(-1)?.token
   assert.equal(w.peerCalls.at(-1)?.status, 200)
   assert.ok(atBoot)
@@ -188,7 +188,7 @@ test('a tile still renders ELEVEN MINUTES after boot — the ten-minute cliff', 
   assert.equal(stale.status, 401, 'the token held at boot MUST be dead by now')
 
   // SECOND — the fix, through the wiring `src/index.ts` uses.
-  await upstreams.pricingRates('req-2')
+  await upstreams.for('mainnet').pricingRates('req-2')
   assert.equal(w.peerCalls.at(-1)?.status, 200, 'the tile must still render past the first expiry')
   assert.notEqual(w.peerCalls.at(-1)?.token, atBoot, 'and on a genuinely new token')
 })
@@ -203,8 +203,8 @@ test('each peer gets its OWN narrow token from the one credential', async (t) =>
   // would be ONE string in this process's memory that reads wallets, ledgers, billing and policy
   // at once — which is exactly the property AD-05 exists to deny, and this is the estate's
   // highest fan-out surface.
-  await upstreams.pricingRates('req-1')
-  await upstreams.policyFreezes('user-1', 'req-2').catch(() => {})
+  await upstreams.for('mainnet').pricingRates('req-1')
+  await upstreams.for('mainnet').policyFreezes('user-1', 'req-2').catch(() => {})
 
   assert.equal(w.scopeRequests.length, 2, 'the peers must not share one token')
   assert.deepEqual(w.scopeRequests[0], [...UPSTREAM_SCOPES.pricing])
@@ -221,13 +221,13 @@ test('an unreachable identity is a 503, never an unauthenticated peer call', asy
   clockAt(0)
 
   const upstreams = upstreamsFor(w, CREDENTIAL)
-  await upstreams.pricingRates('req-1')
+  await upstreams.for('mainnet').pricingRates('req-1')
 
   w.identityDown = true
   clockAt((SERVICE_TTL_SECONDS + 60) * 1000)
   const before = w.peerCalls.length
 
-  await assert.rejects(() => upstreams.pricingRates('req-2'))
+  await assert.rejects(() => upstreams.for('mainnet').pricingRates('req-2'))
   // The peer was never dialled. Sending the expired token, or none, would produce a 401 from a
   // healthy pricing — and on this surface a 401 is the shape that reads as "the user is signed
   // out", which is precisely the misattribution `Verifier` refuses to make inbound.
@@ -248,7 +248,7 @@ test('with no credential the service is NOT ready, and every tile fails closed',
   assert.equal(probe.kind, 'hard')
   assert.equal((await probe.check()).state, 'fail', 'an unconfigured replica must not take traffic')
 
-  await assert.rejects(() => upstreams.pricingRates('req-1'))
+  await assert.rejects(() => upstreams.for('mainnet').pricingRates('req-1'))
   assert.equal(w.peerCalls.length, 0, 'and nothing was sent unauthenticated')
 })
 
@@ -271,7 +271,7 @@ test('a credential fault is counted as token_unavailable, per upstream', async (
   const metrics = registerServiceMetrics(registerHttpMetrics(new Metrics()))
   const upstreams = upstreamsFor(w, null, metrics)
 
-  await assert.rejects(() => upstreams.pricingRates('req-1'))
+  await assert.rejects(() => upstreams.for('mainnet').pricingRates('req-1'))
   assert.equal(w.peerCalls.length, 0, 'the peer was never dialled, so it is not the peer that failed')
 
   const rendered = metrics.render()
@@ -300,7 +300,7 @@ test('a healthy call is counted too, so the counter has a denominator', async (t
 
   const metrics = registerServiceMetrics(registerHttpMetrics(new Metrics()))
   const upstreams = upstreamsFor(w, CREDENTIAL, metrics)
-  await upstreams.pricingRates('req-1')
+  await upstreams.for('mainnet').pricingRates('req-1')
 
   const rendered = metrics.render()
   // KILLS: counting only failures — a rate needs both halves, and "no token_unavailable in the

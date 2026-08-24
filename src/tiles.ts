@@ -103,6 +103,16 @@ export function worstStatus(statuses: readonly TileStatus[]): TileStatus {
 
 export interface TileDeps {
   readonly cache: TtlCache
+  /**
+   * The estate this request belongs to, PREFIXED ONTO EVERY CACHE KEY below.
+   *
+   * Here rather than in each `LoadTile.key` literal, and that placement is the point: there are a
+   * dozen of those and a thirteenth gets added every few weeks. One that forgot the prefix would
+   * serve a mainnet portfolio to a testnet viewer — a correct-looking dashboard with somebody
+   * else's estate's numbers in it, and no error anywhere. Prefixing at the single read site means
+   * a new tile cannot forget.
+   */
+  readonly network: string
   readonly metrics: Metrics
   readonly logger: Logger
   readonly now?: () => number
@@ -138,7 +148,8 @@ export interface LoadTile<T> {
  */
 export async function loadTile<T>(deps: TileDeps, spec: LoadTile<T>): Promise<Tile<T>> {
   const now = deps.now ?? (() => Date.now())
-  const cached = deps.cache.read<T>(spec.key, spec.ttlMs, spec.staleMs)
+  const key = `${deps.network}:${spec.key}`
+  const cached = deps.cache.read<T>(key, spec.ttlMs, spec.staleMs)
 
   if (cached.outcome === 'fresh' && cached.value !== undefined) {
     deps.metrics.increment('hub_cache_hits_total', { upstream: spec.upstream })
@@ -156,7 +167,7 @@ export async function loadTile<T>(deps: TileDeps, spec: LoadTile<T>): Promise<Ti
   try {
     const data = await spec.load()
     deps.metrics.observe('hub_upstream_ms', now() - startedAt, { service: spec.upstream })
-    deps.cache.write(spec.key, data)
+    deps.cache.write(key, data)
     return record(deps, spec.tile, okTile(spec.upstream, data))
   } catch (err) {
     deps.metrics.observe('hub_upstream_ms', now() - startedAt, { service: spec.upstream })
@@ -169,7 +180,7 @@ export async function loadTile<T>(deps: TileDeps, spec: LoadTile<T>): Promise<Ti
 
     // The stale window, consulted only now. Reading it before the upstream would serve old data
     // when new data was available for the asking.
-    const stale = deps.cache.read<T>(spec.key, spec.ttlMs, spec.staleMs)
+    const stale = deps.cache.read<T>(key, spec.ttlMs, spec.staleMs)
     if (stale.value !== undefined) {
       deps.metrics.increment('hub_cache_hits_total', { upstream: spec.upstream })
       return record(deps, spec.tile, {

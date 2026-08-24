@@ -142,7 +142,12 @@ const server = createServer({
   logger,
   metrics,
   verifier,
-  upstreams,
+  // The per-network SELECTOR. `forRequest` narrows it before any route runs, so every outbound
+  // call carries the estate this request belongs to.
+  upstreamsFor: upstreams,
+  // The boot-time view, for the default network. Replaced per request.
+  upstreams: upstreams.for((env.singleNetwork || 'mainnet') as 'mainnet' | 'testnet'),
+  ...(env.singleNetwork ? { singleNetwork: env.singleNetwork as 'mainnet' | 'testnet' } : {}),
   cache,
   dashboardDeadlineMs: env.dashboardDeadlineMs,
   poolApi: env.poolApi,
